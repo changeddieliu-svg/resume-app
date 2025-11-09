@@ -1,0 +1,41 @@
+# ===========================
+# AI Resume Optimizer Project
+# ===========================
+
+# 🔒 Environment & Secrets
+.env
+*.env
+
+# 🧠 Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+.venv/
+venv/
+
+# 💾 System files
+.DS_Store
+Thumbs.db
+
+# 📄 Temporary and export files
+*.pdf
+*.docx
+*.txt
+*.zip
+
+# ⚙️ Streamlit & Logs
+.streamlit/logs/
+logs/
+*.log
+
+# 🧰 IDE & Editor configs
+.vscode/
+.idea/
+
+# 🚀 Output / Generated Files
+output/
+temp/
+cache/
