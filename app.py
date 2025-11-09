@@ -1,14 +1,46 @@
-# app_user_refined.py — 正式版外观（单一模式；求职信语言自动；无 ATS 检测/无多版本/无支付）
-# 依赖：streamlit pdfplumber python-docx python-dotenv reportlab pdf2image pytesseract pillow openai
+# app.py — 正式版（无水印 / 隐藏顶栏 / 轻量防拷）
+# 依赖：streamlit pdfplumber python-docx python-dotenv openai
+# 可选：reportlab（导出PDF） pdf2image+pytesseract+pillow（OCR）
+# 部署：把 OPENAI_API_KEY 放到 Streamlit Secrets 或本地 .env
 
 import os, io, re, json
 from typing import List, Dict, Tuple
 import streamlit as st
 import pdfplumber
-from dotenv import load_dotenv
 from docx import Document
+from dotenv import load_dotenv
 
-# ---------- 可选 PDF 导出 ----------
+# ===== 页面配置（隐藏 GitHub/Share/菜单/底部标识）=====
+st.set_page_config(
+    page_title="AI 智能简历优化",
+    page_icon="🧩",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={"Get Help": None, "Report a bug": None, "About": None},
+)
+st.markdown("""
+<style>
+[data-testid="stToolbar"] {visibility: hidden; height: 0;}  /* 隐藏右上角工具条 */
+#MainMenu {visibility: hidden;}                               /* 隐藏左上角菜单 */
+footer {visibility: hidden;}                                  /* 隐藏底部水印 */
+.block-container {padding-top: 1rem;}                         /* 顶部间距微调 */
+</style>
+""", unsafe_allow_html=True)
+
+# ===== 轻量防拷（不影响正常使用）=====
+st.markdown("""
+<script>
+console.log("%c警告 WARNING","color:#fff;background:#d32f2f;padding:6px 10px;border-radius:4px;font-weight:700;font-size:14px");
+console.log("%c本应用与其提示词/模板受版权保护。未授权复制、爬取、商用将承担法律责任。","color:#d32f2f;font-size:12px");
+document.addEventListener("contextmenu", e => e.preventDefault()); // 禁右键
+document.addEventListener("keydown", e => {                        // 禁常见快捷键
+  const k=(e.key||"").toLowerCase();
+  if(((e.ctrlKey||e.metaKey)&&(k==="s"||k==="u"||(e.shiftKey&&k==="i")))||k==="f12"){e.preventDefault();}
+});
+</script>
+""", unsafe_allow_html=True)
+
+# ===== 可选 PDF 导出 =====
 try:
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import A4
@@ -17,7 +49,7 @@ try:
 except Exception:
     HAS_PDF = False
 
-# ---------- 可选 OCR ----------
+# ===== 可选 OCR =====
 _HAS_OCR = True
 try:
     from pdf2image import convert_from_bytes
@@ -26,7 +58,7 @@ try:
 except Exception:
     _HAS_OCR = False
 
-# ---------- OpenAI ----------
+# ===== OpenAI 客户端 =====
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 client = None
@@ -37,9 +69,7 @@ if OPENAI_API_KEY:
     except Exception:
         client = None
 
-# ======================================================
-# 工具函数
-# ======================================================
+# ================ 工具函数 ================
 def to_plain_text(x) -> str:
     if isinstance(x, str): return x
     try:
@@ -58,6 +88,7 @@ def extract_text_from_pdf_bytes(data: bytes, enable_ocr=True) -> Tuple[str, bool
             text = "\n".join(pages).strip()
     except Exception:
         text = ""
+    # 若文本太少，尝试 OCR
     if enable_ocr and len(text) < 80:
         if not _HAS_OCR:
             return text, False, pages_count, ""
@@ -114,24 +145,16 @@ def robust_json_loads(s: str):
         return json.loads(s[start:end+1])
     raise ValueError("无法从模型输出中解析有效 JSON。")
 
-def infer_title_from_filename(name: str) -> str:
-    if not name: return "Curriculum Vitae"
-    base = re.sub(r"\.(pdf|docx)$", "", name, flags=re.I)
-    base = re.sub(r"[_-]+", " ", base).strip()
-    base = re.sub(r"(?i)optimized\s*resume", "", base).strip()
-    if not base: return "Curriculum Vitae"
-    return f"{base} – CV"
-
-# ---------- 简历语言检测（决定求职信语言） ----------
 def detect_resume_language(text: str) -> str:
-    """返回 'en' or 'zh'（启发式）：中文汉字数 vs 英文字母数；默认英文"""
     chinese = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
     english = sum(1 for c in text if c.isascii() and c.isalpha())
     return "zh" if chinese > english else "en"
 
-# ======================================================
-# OpenAI 调用
-# ======================================================
+def split_jd_blocks(text: str):
+    if not text.strip(): return []
+    return [b.strip() for b in text.split("\n---\n") if b.strip()]
+
+# ================ 模型调用 ================
 BASE_TASK = """
 【原始简历】
 {resume_text}
@@ -159,18 +182,14 @@ BASE_TASK = """
 }}
 """
 
-def build_prompt(resume_text: str, jd_text: str, refine: List[str], emphasis: str,
+def build_prompt(resume_text: str, jd_text: str, refine, emphasis: str,
                  want_cover: bool, cl_lang: str) -> str:
     refine_str = "、".join(refine) if refine else "均衡"
-    # 求职信语言指令
     if want_cover:
-        if cl_lang == "zh":
-            cover_directive = "生成中文求职信（Cover Letter），≤ 1 页，正式职场语气。"
-        else:
-            cover_directive = "Generate an English cover letter (≤ 1 page, professional tone)."
+        cover_directive = "生成中文求职信（Cover Letter），≤ 1 页，正式职场语气。" if cl_lang == "zh" \
+            else "Generate an English cover letter (≤ 1 page, professional tone)."
     else:
         cover_directive = "无需生成求职信（Cover Letter）。"
-
     head = f"""你是一名资深职业顾问。
 请根据以下简历与职位描述进行专业优化。
 精修侧重：{refine_str}；强调点：{emphasis or '数据驱动、可量化、关键词契合'}。
@@ -178,23 +197,18 @@ def build_prompt(resume_text: str, jd_text: str, refine: List[str], emphasis: st
 语言要求：
 - optimized_resume：沿用原简历语言（中文→中文，英文→英文）。
 - cover_letter：严格按照上面的语言指令（与简历语言一致）。"""
-    return head + BASE_TASK.format(
-        resume_text=resume_text,
-        jd_text=jd_text,
-        cover_directive=cover_directive
-    )
+    return head + BASE_TASK.format(resume_text=resume_text, jd_text=jd_text, cover_directive=cover_directive)
 
 def call_openai_json(prompt: str) -> Dict:
     if client is None:
         return {
-            "optimized_resume": "Demo mode: 请配置 OPENAI_API_KEY。",
+            "optimized_resume": "Demo mode: 请在 Secrets 或 .env 配置 OPENAI_API_KEY。",
             "match_score": 0, "missing_keywords": [], "suggested_bullets": [],
             "notes": "未配置 OPENAI_API_KEY。", "before_bullets": [], "after_bullets": [],
             "cover_letter": ""
         }
-    # 正式外观版使用轻量模型，响应更快；如需更强可切换 gpt-4o
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4o-mini",    # 轻量快速；如需更强可改为 gpt-4o
         temperature=0.2,
         response_format={"type": "json_object"},
         messages=[
@@ -209,14 +223,11 @@ def call_openai_json(prompt: str) -> Dict:
         return {"optimized_resume": raw, "match_score": 0, "missing_keywords": [],
                 "suggested_bullets": [], "notes": "", "cover_letter": ""}
 
-# ======================================================
-# UI
-# ======================================================
-st.set_page_config(page_title="AI 智能简历优化", page_icon="🧩", layout="wide")
-st.title("🧩 AI 智能简历优化")
-st.caption("让你的简历更符合 HR 与算法的语言。可选自动生成求职信（Cover Letter）。")
+# ================ UI ================
+st.title("🧠 AI 智能简历优化")
+st.caption("上传简历，AI 将根据 JD 一键优化；可选生成求职信（Cover Letter，语言自动跟随简历）。")
 
-# session state
+# session
 if "results" not in st.session_state: st.session_state.results = []
 if "params" not in st.session_state: st.session_state.params = {}
 if "export_title" not in st.session_state: st.session_state.export_title = ""
@@ -241,10 +252,6 @@ with right:
 
 run = st.button("🚀 一键生成", type="primary", use_container_width=True)
 
-def split_jd_blocks(text: str):
-    if not text.strip(): return []
-    return [b.strip() for b in text.split("\n---\n") if b.strip()]
-
 def split_and_run(resume_text: str, jd_text: str, cl_lang: str):
     blocks = split_jd_blocks(jd_text) or [jd_text.strip()]
     results = []
@@ -261,19 +268,17 @@ if run:
     if not uploaded or not jd_text.strip():
         st.error("请上传简历并粘贴 JD。")
     else:
-        # 文件名→导出标题
+        # 导出文件名基于上传名
         st.session_state.export_title = re.sub(r"[\\/]", "-", re.sub(r"\.(pdf|docx)$","",uploaded.name, flags=re.I)).strip() or "Curriculum Vitae"
-        # 解析文件
+        # 解析简历
         if uploaded.name.lower().endswith(".pdf"):
             data = uploaded.getvalue()
             resume_text, used_ocr, pages, ocr_lang_used = extract_text_from_pdf_bytes(data, enable_ocr=enable_ocr)
         else:
             resume_text = extract_text_from_docx(uploaded); used_ocr, pages, ocr_lang_used = False, None, None
-
         if not resume_text.strip():
             st.error("未从文件中提取到文本。若为扫描PDF，请启用 OCR 并安装依赖。")
         else:
-            # 检测简历语言（决定求职信语言）
             cl_lang = detect_resume_language(resume_text)
             st.session_state.resume_lang = cl_lang
             st.session_state.results = split_and_run(resume_text, jd_text, cl_lang=cl_lang)
@@ -291,7 +296,6 @@ def current_result():
     sel = st.selectbox("选择查看的 JD 结果：", labels, index=0)
     return lst[labels.index(sel)], sel
 
-# ---------- 展示 ----------
 tabs = st.tabs(["⭐ 优化后简历", "✉️ 求职信（Cover Letter）", "📤 导出"])
 
 with tabs[0]:
@@ -325,7 +329,7 @@ with tabs[2]:
         export_title = (st.session_state.get('export_title') or 'Curriculum Vitae').strip()
         txt = (res.get("optimized_resume","") or "").strip()
 
-        # 仅导出（无 ATS 检测）
+        # 下载 DOCX（无水印）
         try:
             st.download_button("⬇️ 下载 DOCX（主版本）", data=make_docx_from_text(txt),
                                file_name=f"{export_title}.docx",
@@ -334,6 +338,7 @@ with tabs[2]:
         except Exception as e:
             st.warning(f"DOCX 导出失败：{e}")
 
+        # 下载 PDF（无水印）
         if HAS_PDF:
             try:
                 st.download_button("⬇️ 下载 PDF（主版本）", data=make_pdf_from_text(txt),
@@ -344,6 +349,7 @@ with tabs[2]:
         else:
             st.info("需要安装 reportlab 才能导出 PDF：pip install reportlab")
 
+        # 求职信导出（无水印）
         cl = (res.get("cover_letter","") or "").strip()
         if cl:
             st.subheader("求职信（Cover Letter）导出")
@@ -361,3 +367,6 @@ with tabs[2]:
                                        mime="application/pdf", use_container_width=True)
                 except Exception as e:
                     st.warning(f"COVER PDF 导出失败：{e}")
+
+# 页尾版权说明（不影响导出）
+st.info("ⓘ 本应用（含提示词/模板/导出样式）受版权保护。仅供个人求职使用，禁止未授权复制、爬取或商用。")
