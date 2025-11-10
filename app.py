@@ -1,6 +1,6 @@
 # app.py
-# AI 智能简历优化（自动识别中/英文 -> 同语种输出；可生成 Cover Letter；下载后不丢结果；增强点可输入）
-# 轻依赖：默认用 pdfplumber / python-docx；OCR 与 PDF 导出为可选能力（不安装也能跑）
+# AI 智能简历优化（自动识别中/英文 -> 同语种输出；Cover Letter；下载后不丢结果；增强点可输入）
+# 富文本 DOCX 导出：解析 **粗体** / *斜体* / 列表 / 标题，解决加粗变奇怪引号问题
 
 import os
 import io
@@ -45,17 +45,14 @@ from openai import OpenAI
 st.set_page_config(page_title="AI 智能简历优化", page_icon="🧠", layout="wide")
 st.markdown("""
 <style>
-/* 可选：隐藏右上角工具条/左上角菜单/底部水印（需要的话保留）*/
 [data-testid="stToolbar"] {visibility: hidden; height: 0;}
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
 .block-container {padding-top: 1rem;}
 </style>
 <script>
-// 控制台提示（不影响功能）
 console.log("%c警告 WARNING","color:#fff;background:#d32f2f;padding:6px 10px;border-radius:4px;font-weight:700;font-size:14px");
 console.log("%c本应用与其提示词/模板受版权保护。仅供个人求职使用，禁止未授权复制、爬取或商用。","color:#d32f2f;font-size:12px");
-// 降低随手复制的便利度（可删）
 document.addEventListener("contextmenu", e => e.preventDefault());
 </script>
 """, unsafe_allow_html=True)
@@ -99,7 +96,7 @@ def detect_lang_en_zh(text: str) -> str:
     if _HAS_LANGDETECT:
         try:
             code = _langdetect(t)
-            if code.startswith("zh"): 
+            if code.startswith("zh"):
                 return "zh"
             if code.startswith("en"):
                 return "en"
@@ -203,13 +200,96 @@ def call_openai(messages, temperature=0.2) -> str:
     )
     return (resp.choices[0].message.content or "").strip()
 
-# =================== 导出 ===================
-def export_docx(text: str, title: Optional[str] = None) -> bytes:
+# =================== 导出：富文本 DOCX（修复加粗变引号问题） ===================
+from docx.shared import Pt
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+def _set_default_fonts(doc: Document, lang: str = "en"):
+    # 正文字体
+    doc.styles['Normal'].font.name = 'Calibri'
+    doc.styles['Normal'].font.size = Pt(11)
+    # 东亚字体（避免中文怪字符）
+    style = doc.styles['Normal']._element
+    rPr = style.get_or_add_rPr()
+    rFonts = rPr.find(qn('w:rFonts'))
+    if rFonts is None:
+        rFonts = OxmlElement('w:rFonts')
+        rPr.append(rFonts)
+    rFonts.set(qn('w:eastAsia'), 'Microsoft YaHei' if lang == 'zh' else 'Calibri')
+
+def _add_markdown_runs(p, text: str):
+    # 解析 **bold** 与 *italic*
+    tokens = []
+    i = 0
+    pattern = re.compile(r'(\*\*.*?\*\*|\*.*?\*)')
+    for m in pattern.finditer(text):
+        if m.start() > i:
+            tokens.append(("text", text[i:m.start()]))
+        tokens.append(("md", m.group(0)))
+        i = m.end()
+    if i < len(text):
+        tokens.append(("text", text[i:]))
+
+    for kind, val in tokens:
+        if kind == "text":
+            p.add_run(val)
+        else:
+            if val.startswith("**") and val.endswith("**"):
+                run = p.add_run(val[2:-2])
+                run.bold = True
+            elif val.startswith("*") and val.endswith("*"):
+                run = p.add_run(val[1:-1])
+                run.italic = True
+            else:
+                p.add_run(val)
+
+def _add_paragraph_by_markdown_line(doc: Document, line: str):
+    s = line.rstrip()
+
+    if not s:
+        doc.add_paragraph("")
+        return
+
+    # 标题
+    if s.startswith("## "):
+        p = doc.add_paragraph()
+        r = p.add_run(s[3:].strip()); r.bold = True
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+        return
+    if s.startswith("# "):
+        p = doc.add_paragraph()
+        r = p.add_run(s[2:].strip()); r.bold = True; r.font.size = Pt(13)
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
+        return
+
+    # 无序列表
+    if re.match(r'^\s*[-•·]\s+', s):
+        item = re.sub(r'^\s*[-•·]\s+', '', s).strip()
+        p = doc.add_paragraph(style='List Bullet')
+        _add_markdown_runs(p, item)
+        return
+
+    # 有序列表
+    if re.match(r'^\s*\d+\.\s+', s):
+        item = re.sub(r'^\s*\d+\.\s+', '', s).strip()
+        p = doc.add_paragraph(style='List Number')
+        _add_markdown_runs(p, item)
+        return
+
+    # 普通段落
+    p = doc.add_paragraph()
+    _add_markdown_runs(p, s)
+
+def export_docx_rich(text: str, lang: str = "en", title: str = None) -> bytes:
     doc = Document()
+    _set_default_fonts(doc, lang=lang)
     if title:
-        doc.add_heading(title, level=1)
+        h = doc.add_heading(title, level=1)
+        h.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
     for line in (text or "").splitlines():
-        doc.add_paragraph(line)
+        _add_paragraph_by_markdown_line(doc, line)
     out = io.BytesIO()
     doc.save(out)
     out.seek(0)
@@ -379,25 +459,16 @@ if opt_resume:
         idx = 1
 
     with rest[idx]:
-        # DOCX 导出
+        # ✅ 仅保留 DOCX + PDF 导出
         st.download_button(
             "⬇️ 下载简历（DOCX）",
-            data=export_docx(opt_resume, title=None),
+            data=export_docx_rich(opt_resume, lang=st.session_state.get("resume_lang","en"), title=None),
             file_name=f"{export_title}.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
             key="dl_resume_docx"
         )
-        # TXT 导出
-        st.download_button(
-            "⬇️ 下载简历（TXT）",
-            data=opt_resume.encode("utf-8"),
-            file_name=f"{export_title}.txt",
-            mime="text/plain",
-            use_container_width=True,
-            key="dl_resume_txt"
-        )
-        # PDF（若可用）
+
         if _HAS_PDF:
             pdf_bytes = export_pdf_simple(opt_resume, title=None)
             if pdf_bytes:
@@ -414,19 +485,11 @@ if opt_resume:
             st.subheader("求职信（Cover Letter）")
             st.download_button(
                 "⬇️ 下载求职信（DOCX）",
-                data=export_docx(opt_cl, title=None),
+                data=export_docx_rich(opt_cl, lang=st.session_state.get("resume_lang","en"), title=None),
                 file_name=f"{export_title}_CoverLetter.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True,
                 key="dl_cl_docx"
-            )
-            st.download_button(
-                "⬇️ 下载求职信（TXT）",
-                data=opt_cl.encode("utf-8"),
-                file_name=f"{export_title}_CoverLetter.txt",
-                mime="text/plain",
-                use_container_width=True,
-                key="dl_cl_txt"
             )
             if _HAS_PDF:
                 cl_pdf = export_pdf_simple(opt_cl, title=None)
