@@ -34,7 +34,7 @@ except Exception:
 from openai import OpenAI
 
 # =============== 页面配置 ===============
-st.set_page_config(page_title="AI 智能简历优化", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="AI 智能简历优化", page_icon="🧠", layout="centered")
 st.markdown("""
 <style>
 [data-testid="stToolbar"], #MainMenu, footer {visibility:hidden;height:0;}
