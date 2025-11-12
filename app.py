@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# AI 智能简历优化 — 完整覆盖版（2025最新版）
+# AI 智能简历优化 v3 — 对齐版 (设置栏高度与主标题对齐)
 
 import io, os, re
 from datetime import datetime
@@ -8,24 +8,26 @@ import streamlit as st
 import pdfplumber
 from docx import Document
 
+
 # ========== 页面配置 ==========
 st.set_page_config(
     page_title="AI 智能简历优化",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
-    menu_items={  # 关闭右上角默认菜单项
+    menu_items={
         "Get Help": None,
         "Report a bug": None,
         "About": None,
     },
 )
 
-# ========== 页面样式（顶部齐平 + 隐藏菜单） ==========
+
+# ========== 样式优化（去顶留白 + 左右对齐 + 隐藏菜单） ==========
 st.markdown("""
 <style>
 
-/* 隐藏右上角菜单/分享按钮 */
+/* 隐藏右上角默认菜单按钮 */
 header [data-testid="stToolbar"],
 header [data-testid="stActionButtonIcon"],
 header [data-testid="stDeployButton"],
@@ -34,46 +36,60 @@ header .stAppHeaderRight {
   display: none !important;
 }
 
-/* 顶部留白压缩，让标题与左栏齐平 */
+/* Header 高度设为0，彻底移除顶部留白 */
 [data-testid="stHeader"] {
-  visibility: visible !important;
-  height: 2.4rem !important;         /* 顶部高度 */
+  visibility: hidden !important;
+  height: 0 !important;
+  min-height: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
   background: transparent !important;
 }
 
-.block-container {
-  padding-top: 0.6rem !important;    /* 主区域上移 */
+/* 主内容区与左侧栏顶部对齐 */
+.appview-container .main .block-container {
+  padding-top: 0.4rem !important;   /* 控制右侧主标题下移程度 */
+  padding-bottom: 0.8rem !important;
   max-width: 1200px !important;
-  margin: auto !important;
+  margin: 0 auto !important;
 }
 
-/* 上传控件样式 */
-[data-testid="stFileUploader"] small { display: none !important; } /* 隐藏默认200MB提示 */
-[data-testid="stFileUploader"] { margin-bottom: 0.6rem !important; }
+/* 左侧栏顶部压缩，与右侧标题对齐 */
+[data-testid="stSidebar"] .block-container {
+  padding-top: 0.35rem !important;  /* 左侧“设置”标题对齐点 */
+  padding-bottom: 0.6rem !important;
+}
 
-/* 标题与控件间距 */
-h1, h2, h3 { margin-top: 0.15rem !important; margin-bottom: 0.4rem !important; }
+/* 标题间距 */
+h1, h2, h3 {
+  margin-top: 0.1rem !important;
+  margin-bottom: 0.4rem !important;
+}
 
-/* 主按钮样式 */
+/* 上传组件优化：隐藏200MB提示 */
+[data-testid="stFileUploader"] small { display: none !important; }
+[data-testid="stFileUploader"] { margin-bottom: 0.4rem !important; }
+
+/* 主按钮 */
 button[kind="primary"] {
   font-weight: 600 !important;
   border-radius: 6px !important;
-  padding: 0.6rem 0 !important;
+  padding: 0.55rem 0 !important;
   font-size: 1rem !important;
 }
 
-/* 提示框样式 */
+/* 提示框 */
 .tip-box {
   background: rgba(130,130,130,0.08);
   border: 1px dashed rgba(130,130,130,0.35);
-  padding: 0.7rem 0.9rem;
+  padding: 0.65rem 0.9rem;
   border-radius: 8px;
   font-size: 0.92rem;
   line-height: 1.5;
 }
 
-/* 隐藏Streamlit底部装饰(可选) */
-/* [data-testid="stDecoration"] { display:none !important; } */
+/* 隐藏底部Streamlit装饰 */
+[data-testid="stDecoration"] { display:none !important; }
 
 </style>
 """, unsafe_allow_html=True)
@@ -83,6 +99,7 @@ button[kind="primary"] {
 ALLOWED_EXTS = {"pdf", "docx"}
 MAX_FILE_MB = 50
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+
 
 def file_too_large(file) -> bool:
     try:
@@ -96,10 +113,12 @@ def file_too_large(file) -> bool:
     except Exception:
         return False
 
+
 def read_docx(file) -> str:
     doc = Document(file)
     parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     return "\n".join(parts)
+
 
 def read_pdf(file, use_ocr=False) -> str:
     text = []
@@ -116,10 +135,12 @@ def read_pdf(file, use_ocr=False) -> str:
         full = "[OCR占位] 当前为扫描件简历，占位示例文本。"
     return full
 
+
 def detect_language(text: str) -> str:
     cjk = re.findall(r'[\u4e00-\u9fa5]', text)
     letters = re.findall(r'[A-Za-z]', text)
     return "zh" if len(cjk) >= len(letters) else "en"
+
 
 def make_docx_bytes(content: str, title="resume") -> bytes:
     doc = Document()
@@ -128,6 +149,7 @@ def make_docx_bytes(content: str, title="resume") -> bytes:
     bio = io.BytesIO()
     doc.save(bio)
     return bio.getvalue()
+
 
 def build_demo_optimized(resume_text, jd_text, highlights, extra, lang):
     bullet = "•" if lang == "en" else "·"
@@ -142,6 +164,7 @@ def build_demo_optimized(resume_text, jd_text, highlights, extra, lang):
     out += ["", f"{req}:", jd_text.strip() or "(无)"]
     out += ["", "—— 以下为原始内容提取 ——", resume_text[:2500]]
     return "\n".join(out).strip()
+
 
 def build_demo_cover_letter(resume_text, jd_text, lang):
     if lang == "en":
@@ -176,10 +199,11 @@ with st.sidebar:
     st.markdown("---")
     st.caption("仅供个人求职使用，禁止商用与爬取。")
 
+
 # ========== 主体 ==========
 st.markdown("## 🧠 AI 智能简历优化")
 
-col_left, col_right = st.columns([1, 1])
+col_left, col_right = st.columns([1, 1], gap="small")
 
 with col_left:
     st.markdown("### 上传简历（PDF 或 DOCX）")
@@ -200,6 +224,7 @@ st.write("")
 generate_btn = st.button("🚀 一键生成", type="primary", use_container_width=True)
 
 out_box = st.container()
+
 
 # ========== 生成逻辑 ==========
 if generate_btn:
@@ -223,8 +248,6 @@ if generate_btn:
         st.stop()
 
     lang = detect_language(resume_text)
-    api_key = st.secrets.get("OPENAI_API_KEY", "")
-    in_demo = not bool(api_key)
 
     with st.spinner("正在生成优化简历…"):
         optimized_resume = build_demo_optimized(resume_text, jd_text, selected_tags, extra_points, lang)
@@ -251,6 +274,7 @@ if generate_btn:
                            file_name=f"Cover_Letter_{ts}.docx",
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                            use_container_width=True)
+
 
 st.write("")
 st.write("---")
