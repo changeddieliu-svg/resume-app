@@ -1,123 +1,216 @@
 # analytics.py
-# 简单 Google Sheet + Slack 埋点，带安全的 session_id 处理
+from __future__ import annotations
 
-import os
 import json
+import os
+import uuid
 from datetime import datetime
-from uuid import uuid4
+from typing import Any, Dict, Optional
 
 import streamlit as st
 
-# ============== Session 处理（修复 KeyError 的关键）==============
+# 可选依赖：Google Sheet
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
 
-def get_session_id() -> str:
-    """
-    确保每个浏览器会话有一个稳定的 session_id。
-    如果 session_state 里还没有，就自动生成一个。
-    """
+    HAS_GSHEET = True
+except Exception:
+    HAS_GSHEET = False
+
+# 可选依赖：Slack
+try:
+    import requests  # 确保 requirements.txt 里有 requests
+except Exception:  # 理论上不会，但防御一下
+    requests = None
+
+
+# =============== 基础工具 ===============
+
+def _get_session_id() -> str:
+    """在当前 session_state 中分配一个匿名访客 ID。"""
     if "sid" not in st.session_state:
-        st.session_state["sid"] = str(uuid4())
+        st.session_state["sid"] = str(uuid.uuid4())
     return st.session_state["sid"]
 
 
-# ============== Google Sheet 相关（可选，不配置也能跑）==============
+def _utc_iso() -> str:
+    return datetime.utcnow().isoformat()
 
-def _get_gsheet_client():
+
+# =============== Google Sheet 相关 ===============
+
+def _get_gsheet_worksheet(sheet_name: str = "events"):
     """
-    使用 Streamlit secrets 里的服务账号 JSON 创建 gspread client。
-    如果没配置，就返回 None，只在日志里提示，不中断应用。
+    返回指定名称的 Worksheet，没有就创建。
+    如果环境变量或依赖不完整，返回 None。
     """
-    try:
-        import gspread  # 只有真的要用的时候才 import
-    except ImportError:
-        # requirements.txt 里没装 gspread 的情况下，直接跳过
-        st.warning("gspread 未安装，暂不记录分析数据。")
+    if not HAS_GSHEET:
         return None
 
-    service_account_info = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not service_account_info:
-        # 你还没在 secrets 里配置这一项
-        return None
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
 
-    if isinstance(service_account_info, str):
-        # 有些人会把 JSON 直接作为字符串存到 secrets
-        service_account_info = json.loads(service_account_info)
-
-    return gspread.service_account_from_dict(service_account_info)
-
-
-def _get_worksheet():
-    """
-    获取 Google Sheet 的第一个 worksheet。
-    如果没配置 Sheet ID，返回 None。
-    """
-    sheet_id = st.secrets.get("ANALYTICS_SHEET_ID")
-    if not sheet_id:
-        return None
-
-    client = _get_gsheet_client()
-    if client is None:
+    if not raw_json or not sheet_id:
         return None
 
     try:
+        info = json.loads(raw_json)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        client = gspread.authorize(creds)
         sh = client.open_by_key(sheet_id)
-        ws = sh.sheet1
+        try:
+            ws = sh.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=20)
         return ws
-    except Exception as e:
-        # 不影响主流程，只是提示
-        st.toast(f"⚠️ 分析数据暂时无法写入：{e}", icon="⚠️")
+    except Exception:
+        # 所有错误都静默，避免影响主业务
         return None
 
 
-# ============== Slack 通知（可选）==============
+def _append_row(sheet_name: str, row: list[Any]) -> None:
+    """往指定 sheet 追加一行，失败时静默。"""
+    try:
+        ws = _get_gsheet_worksheet(sheet_name)
+        if ws is None:
+            return
+        ws.append_row(row, value_input_option="RAW")
+    except Exception:
+        # 不让任何异常冒出去
+        return
 
-def send_slack_notification(text: str):
+
+# =============== Slack 通知 ===============
+
+def send_slack_notification(text: str) -> None:
     """
-    如果在 secrets 里配置了 SLACK_WEBHOOK_URL，就发一条消息到 Slack。
-    不配置就静默跳过。
+    发送一条 Slack 通知。
+    如果没有配置 SLACK_WEBHOOK_URL 或 requests 不可用，则静默。
     """
-    webhook_url = st.secrets.get("SLACK_WEBHOOK_URL")
-    if not webhook_url:
+    webhook = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook or requests is None:
         return
 
     try:
-        import requests
-        requests.post(webhook_url, json={"text": text}, timeout=5)
+        requests.post(webhook, json={"text": text}, timeout=5)
     except Exception:
-        # 不要因为 Slack 挂了拖垮主应用
-        pass
+        return
 
 
-# ============== 对外主接口：记录事件 ==============
+# =============== 埋点与反馈接口（供 app.py 调用） ===============
 
-def log_event(event_type: str, meta: dict | None = None):
+def log_event(event_type: str, meta: Optional[Dict[str, Any]] = None) -> None:
     """
-    记录一次埋点事件：
-    - event_type: 例如 "page_view", "generate_clicked", "api_fallback"
-    - meta: 任意附加信息（字典），会以 JSON 存到表里
+    普通事件埋点：页面浏览、生成成功、生成失败等。
+    会尝试写入 Google Sheet 的 `events` 工作表。
     """
-    # 1. 确保有 session_id —— 这是这次修复的关键
-    sid = get_session_id()
+    try:
+        sid = _get_session_id()
+        now = _utc_iso()
+        meta = meta or {}
 
-    # 2. 准备行数据
-    ts = datetime.utcnow().isoformat()
-    meta_json = json.dumps(meta or {}, ensure_ascii=False)
+        # 本地留一份（调试时方便查看）
+        events = st.session_state.get("_events", [])
+        events.append(
+            {
+                "sid": sid,
+                "ts": now,
+                "type": event_type,
+                "meta": meta,
+            }
+        )
+        st.session_state["_events"] = events
 
-    # 可以顺便记录一下 user agent（但在 Streamlit Cloud 上往往拿不到太多）
-    user_agent = st.session_state.get("_user_agent", "")
+        # 写入 Google Sheet
+        _append_row(
+            "events",
+            [
+                now,
+                sid,
+                event_type,
+                json.dumps(meta, ensure_ascii=False),
+            ],
+        )
+    except Exception:
+        # 保底，防止任何异常影响主流程
+        return
 
-    row = [ts, sid, event_type, user_agent, meta_json]
 
-    # 3. 写入 Google Sheet（如果有配置）
-    ws = _get_worksheet()
-    if ws is not None:
-        try:
-            ws.append_row(row, value_input_option="RAW")
-        except Exception as e:
-            # 只在你自己用的时候提示一下，不要影响用户体验
-            if st.session_state.get("_dev_mode"):
-                st.warning(f"写入分析数据失败：{e}")
+def log_feedback(
+    feedback_text: str,
+    contact: str | None = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    用户主动提交的产品反馈。
+    - feedback_text：反馈内容（必填）
+    - contact：邮箱/微信/小红书 ID（选填）
+    """
+    if not feedback_text.strip():
+        return
 
-    # 4. 特定事件触发 Slack 通知（例如 API 降级等）
-    if event_type == "api_fallback":
-        send_slack_notification(f"⚠️ OpenAI API 降级为 Demo：{meta_json}")
+    try:
+        sid = _get_session_id()
+        now = _utc_iso()
+        meta = meta or {}
+
+        _append_row(
+            "feedback",
+            [
+                now,
+                sid,
+                feedback_text,
+                contact or "",
+                json.dumps(meta, ensure_ascii=False),
+            ],
+        )
+
+        # 可选：来一条 Slack 提醒你有人留言了
+        send_slack_notification(
+            f"📝 新用户反馈：\n"
+            f"- SID: {sid}\n"
+            f"- Contact: {contact or 'N/A'}\n"
+            f"- 内容: {feedback_text[:500]}"
+        )
+    except Exception:
+        return
+
+
+def log_error(
+    location: str,
+    error: Exception,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    关键报错收集：在你自己的 try/except 里调用。
+    - location：字符串，说明在哪个步骤出错（例如 'generate_cv'）
+    - error：异常对象
+    """
+    try:
+        sid = _get_session_id()
+        now = _utc_iso()
+        meta = meta or {}
+
+        # 写入 Google Sheet
+        _append_row(
+            "errors",
+            [
+                now,
+                sid,
+                location,
+                repr(error),
+                json.dumps(meta, ensure_ascii=False),
+            ],
+        )
+
+        # 发 Slack 报警
+        send_slack_notification(
+            f"⚠️ 产品报错（{location}）\n"
+            f"- SID: {sid}\n"
+            f"- 时间: {now}\n"
+            f"- 错误: {repr(error)[:800]}"
+        )
+    except Exception:
+        return
