@@ -1,155 +1,123 @@
 # analytics.py
-# Google Sheets logging + Slack alerts + quota/rate-limit fallback
-# Requirements (in requirements.txt):
-#   gspread
-#   oauth2client
-#   requests
+# 简单 Google Sheet + Slack 埋点，带安全的 session_id 处理
 
+import os
 import json
-import time
-import datetime as dt
+from datetime import datetime
 from uuid import uuid4
-from typing import Any, Dict, Optional, Tuple
 
 import streamlit as st
 
-# Optional deps – only used for logging; app won't crash if auth fails
-try:
-    import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
-except Exception:  # pragma: no cover
-    gspread = None
-    ServiceAccountCredentials = None
+# ============== Session 处理（修复 KeyError 的关键）==============
 
-try:
-    import requests
-except Exception:  # pragma: no cover
-    requests = None
+def get_session_id() -> str:
+    """
+    确保每个浏览器会话有一个稳定的 session_id。
+    如果 session_state 里还没有，就自动生成一个。
+    """
+    if "sid" not in st.session_state:
+        st.session_state["sid"] = str(uuid4())
+    return st.session_state["sid"]
 
 
-# -------------------- Session identity --------------------
-# Stable anonymous session id for per-user frequency/DAU
-st.session_state.setdefault("sid", str(uuid4()))
+# ============== Google Sheet 相关（可选，不配置也能跑）==============
 
-
-# -------------------- Config via Streamlit Secrets --------------------
-SHEET_ID: str = st.secrets.get("SHEET_ID", "")
-GCP_SA_JSON: dict = st.secrets.get("GCP_SERVICE_ACCOUNT", {}) or {}
-SLACK_WEBHOOK: str = st.secrets.get("SLACK_WEBHOOK", "")
-
-# Tab names in your Google Sheet (must exist with headers)
-TAB_EVENTS = "events"     # headers: timestamp, sid, event_type, lang, file_size, ocr, jd_len, latency_ms, note
-TAB_FEEDBACK = "feedback" # headers: timestamp, sid, rating, comment
-TAB_FLAGS = "flags"       # headers: timestamp, sid, key, value, note
-
-
-# -------------------- Google Sheet helpers --------------------
-@st.cache_resource(show_spinner=False)
-def _sheet_client():
-    """Authorize and open the Google Sheet. Cached for the process lifetime."""
-    if not (gspread and ServiceAccountCredentials and SHEET_ID and GCP_SA_JSON):
+def _get_gsheet_client():
+    """
+    使用 Streamlit secrets 里的服务账号 JSON 创建 gspread client。
+    如果没配置，就返回 None，只在日志里提示，不中断应用。
+    """
+    try:
+        import gspread  # 只有真的要用的时候才 import
+    except ImportError:
+        # requirements.txt 里没装 gspread 的情况下，直接跳过
+        st.warning("gspread 未安装，暂不记录分析数据。")
         return None
-    scope = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(GCP_SA_JSON, scope)
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(SHEET_ID)
 
-def _append_row(tab: str, row: list) -> None:
-    """Append a single row. Never crash the UI if logging fails."""
+    service_account_info = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not service_account_info:
+        # 你还没在 secrets 里配置这一项
+        return None
+
+    if isinstance(service_account_info, str):
+        # 有些人会把 JSON 直接作为字符串存到 secrets
+        service_account_info = json.loads(service_account_info)
+
+    return gspread.service_account_from_dict(service_account_info)
+
+
+def _get_worksheet():
+    """
+    获取 Google Sheet 的第一个 worksheet。
+    如果没配置 Sheet ID，返回 None。
+    """
+    sheet_id = st.secrets.get("ANALYTICS_SHEET_ID")
+    if not sheet_id:
+        return None
+
+    client = _get_gsheet_client()
+    if client is None:
+        return None
+
     try:
-        sh = _sheet_client()
-        if not sh:
-            return
-        ws = sh.worksheet(tab)
-        ws.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as e:  # pragma: no cover
-        # Silent fail – you can print if needed:
-        # print("Sheet append failed:", e)
-        pass
-
-
-# -------------------- Public logging API --------------------
-def log_event(event_type: str, **props: Any) -> None:
-    """
-    Log an application event to the 'events' tab.
-    Common fields you may pass in props:
-      - lang ("en"/"zh"), file_size (int), ocr (bool), jd_len (int), latency_ms (int), note (str)
-    """
-    row = [
-        dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        st.session_state["sid"],
-        event_type,
-        str(props.get("lang", "")),
-        str(props.get("file_size", "")),
-        str(props.get("ocr", "")),
-        str(props.get("jd_len", "")),
-        str(props.get("latency_ms", "")),
-        json.dumps({
-            k: v for k, v in props.items()
-            if k not in {"lang", "file_size", "ocr", "jd_len", "latency_ms"}
-        }, ensure_ascii=False) or "",
-    ]
-    _append_row(TAB_EVENTS, row)
-
-def log_feedback(rating: Optional[str] = None, comment: str = "") -> None:
-    """Log thumbs (rating='up'/'down') and/or free-text comment to 'feedback'."""
-    row = [
-        dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        st.session_state["sid"],
-        (rating or ""),
-        (comment or "")[:500],
-    ]
-    _append_row(TAB_FEEDBACK, row)
-
-def set_flag(key: str, value: Any, note: str = "") -> None:
-    """Write a key/value flag to 'flags' (e.g., last_quota_fallback)."""
-    row = [
-        dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        st.session_state["sid"],
-        key,
-        json.dumps(value, ensure_ascii=False),
-        note,
-    ]
-    _append_row(TAB_FLAGS, row)
-
-
-# -------------------- Admin notifications (Slack) --------------------
-def notify_admin(text: str) -> None:
-    """Send a Slack message if SLACK_WEBHOOK is configured."""
-    if not (SLACK_WEBHOOK and requests):
-        return
-    try:
-        requests.post(SLACK_WEBHOOK, data=json.dumps({"text": text}), timeout=5)
-    except Exception:  # pragma: no cover
-        pass
-
-
-# -------------------- Quota-aware wrapper --------------------
-def call_model_with_fallback(call_fn, *, context: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], bool]:
-    """
-    Execute `call_fn()` (your real OpenAI call). On quota/rate/billing errors:
-      - log generated_demo
-      - set a flag
-      - notify admin (only once per session)
-      - return (None, True) so caller can use demo output
-    Returns: (text_or_none, used_demo: bool)
-    """
-    t0 = time.time()
-    try:
-        out = call_fn()
-        ms = int((time.time() - t0) * 1000)
-        log_event("generated_ok", latency_ms=ms, **(context or {}))
-        return out, False
+        sh = client.open_by_key(sheet_id)
+        ws = sh.sheet1
+        return ws
     except Exception as e:
-        msg = str(e).lower()
-        quota_keywords = ("quota", "rate limit", "insufficient_quota", "billing", "invalid api key", "overloaded")
-        if any(k in msg for k in quota_keywords):
-            if not st.session_state.get("notified_quota"):
-                notify_admin(f"🚨 OpenAI quota/rate fallback. sid={st.session_state['sid']} err={msg[:200]}")
-                st.session_state["notified_quota"] = True
-            log_event("generated_demo", note="quota_or_rate", **(context or {}))
-            set_flag("last_quota_fallback", {"err": msg[:200]})
-            return None, True
-        # Other errors – record and re-raise for UI to handle
-        log_event("error", note=msg[:200], **(context or {}))
-        raise
+        # 不影响主流程，只是提示
+        st.toast(f"⚠️ 分析数据暂时无法写入：{e}", icon="⚠️")
+        return None
+
+
+# ============== Slack 通知（可选）==============
+
+def send_slack_notification(text: str):
+    """
+    如果在 secrets 里配置了 SLACK_WEBHOOK_URL，就发一条消息到 Slack。
+    不配置就静默跳过。
+    """
+    webhook_url = st.secrets.get("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        return
+
+    try:
+        import requests
+        requests.post(webhook_url, json={"text": text}, timeout=5)
+    except Exception:
+        # 不要因为 Slack 挂了拖垮主应用
+        pass
+
+
+# ============== 对外主接口：记录事件 ==============
+
+def log_event(event_type: str, meta: dict | None = None):
+    """
+    记录一次埋点事件：
+    - event_type: 例如 "page_view", "generate_clicked", "api_fallback"
+    - meta: 任意附加信息（字典），会以 JSON 存到表里
+    """
+    # 1. 确保有 session_id —— 这是这次修复的关键
+    sid = get_session_id()
+
+    # 2. 准备行数据
+    ts = datetime.utcnow().isoformat()
+    meta_json = json.dumps(meta or {}, ensure_ascii=False)
+
+    # 可以顺便记录一下 user agent（但在 Streamlit Cloud 上往往拿不到太多）
+    user_agent = st.session_state.get("_user_agent", "")
+
+    row = [ts, sid, event_type, user_agent, meta_json]
+
+    # 3. 写入 Google Sheet（如果有配置）
+    ws = _get_worksheet()
+    if ws is not None:
+        try:
+            ws.append_row(row, value_input_option="RAW")
+        except Exception as e:
+            # 只在你自己用的时候提示一下，不要影响用户体验
+            if st.session_state.get("_dev_mode"):
+                st.warning(f"写入分析数据失败：{e}")
+
+    # 4. 特定事件触发 Slack 通知（例如 API 降级等）
+    if event_type == "api_fallback":
+        send_slack_notification(f"⚠️ OpenAI API 降级为 Demo：{meta_json}")
