@@ -11,9 +11,11 @@ langdetect>=1.0.9
 # 环境变量
 python-dotenv==1.0.1
 
-# Google Sheet 写入（必要）
+# Google Sheet 写入（必须）
 gspread==6.0.2
 google-auth==2.37.0
+google-auth-oauthlib==1.2.0
+oauth2client==4.1.3
 
 # Slack 通知
 slack_sdk==3.27.1
