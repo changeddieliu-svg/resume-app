@@ -5,7 +5,7 @@
 - 读取的是分字段的 Secrets：
   GOOGLE_SHEETS_PROJECT_ID
   GOOGLE_SHEETS_PRIVATE_KEY_ID
-  GOOGLE_SHEETS_PRIVATE_KEY
+  GOOGLE_SHEETS_PRIVATE_KEY   （多行私钥，已经带真实换行）
   GOOGLE_SHEETS_CLIENT_EMAIL
   GOOGLE_SHEETS_CLIENT_ID
   GOOGLE_SHEETS_SHEET_ID
@@ -16,7 +16,7 @@ import json
 from datetime import datetime
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
 # 关键：同时支持环境变量 和 st.secrets
 try:
@@ -70,14 +70,12 @@ worksheet = None
 
 if ANALYTICS_ENABLED:
     try:
-        # 注意：private_key 在 secrets 里是带 \n 的，需要还原成真正的换行
-        fixed_private_key = PRIVATE_KEY.replace("\\n", "\n")
-
+        # 注意：现在 PRIVATE_KEY 已经是多行真实私钥，不需要再 replace("\\n", "\n")
         credentials_dict = {
             "type": "service_account",
             "project_id": PROJECT_ID,
             "private_key_id": PRIVATE_KEY_ID,
-            "private_key": fixed_private_key,
+            "private_key": PRIVATE_KEY,  # 直接用
             "client_email": CLIENT_EMAIL,
             "client_id": CLIENT_ID,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
@@ -91,12 +89,13 @@ if ANALYTICS_ENABLED:
         }
 
         scopes = [
-            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
 
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            credentials_dict, scopes=scopes
+        creds = Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=scopes,
         )
         gc = gspread.authorize(creds)
 
