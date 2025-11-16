@@ -1,61 +1,38 @@
 # analytics.py
 """
-简单的埋点工具：
-- 使用 gspread + service account 写入 Google Sheet
-- 读取的是分字段的 Secrets：
+简单埋点：把事件写入 Google Sheet
+
+依赖：
+- streamlit
+- gspread
+- google-auth
+
+读取的 Secrets（你现在已经配置好了）：
   GOOGLE_SHEETS_PROJECT_ID
   GOOGLE_SHEETS_PRIVATE_KEY_ID
-  GOOGLE_SHEETS_PRIVATE_KEY   （多行真换行）
+  GOOGLE_SHEETS_PRIVATE_KEY   （多行，包含 BEGIN/END PRIVATE KEY）
   GOOGLE_SHEETS_CLIENT_EMAIL
   GOOGLE_SHEETS_CLIENT_ID
   GOOGLE_SHEETS_SHEET_ID
 """
 
-import os
+from __future__ import annotations
+
 import json
 from datetime import datetime
 
+import streamlit as st
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
-# 尝试导入 streamlit（在本地脚本运行时也不至于崩）
-try:
-    import streamlit as st
-except Exception:
-    st = None
+# ------------- 读取 Secrets -------------
 
-
-def _get_secret(name: str) -> str | None:
-    """
-    优先从 Streamlit secrets 读取；
-    如果没有，再尝试从环境变量读取。
-    """
-    # 先看环境变量（本地调试时可能用得到）
-    env_val = os.getenv(name)
-    if env_val:
-        return env_val
-
-    # 在线部署时，从 st.secrets 读取
-    if st is not None:
-        try:
-            # st.secrets 是一个 dict-like 对象
-            return st.secrets.get(name)
-        except Exception:
-            return None
-
-    return None
-
-
-# ---------------------------------------------------------
-# 1. 读取配置（对应 Streamlit Secrets）
-# ---------------------------------------------------------
-
-PROJECT_ID = _get_secret("GOOGLE_SHEETS_PROJECT_ID")
-PRIVATE_KEY_ID = _get_secret("GOOGLE_SHEETS_PRIVATE_KEY_ID")
-PRIVATE_KEY = _get_secret("GOOGLE_SHEETS_PRIVATE_KEY")
-CLIENT_EMAIL = _get_secret("GOOGLE_SHEETS_CLIENT_EMAIL")
-CLIENT_ID = _get_secret("GOOGLE_SHEETS_CLIENT_ID")
-SHEET_ID = _get_secret("GOOGLE_SHEETS_SHEET_ID")
+PROJECT_ID = st.secrets.get("GOOGLE_SHEETS_PROJECT_ID")
+PRIVATE_KEY_ID = st.secrets.get("GOOGLE_SHEETS_PRIVATE_KEY_ID")
+PRIVATE_KEY = st.secrets.get("GOOGLE_SHEETS_PRIVATE_KEY")
+CLIENT_EMAIL = st.secrets.get("GOOGLE_SHEETS_CLIENT_EMAIL")
+CLIENT_ID = st.secrets.get("GOOGLE_SHEETS_CLIENT_ID")
+SHEET_ID = st.secrets.get("GOOGLE_SHEETS_SHEET_ID")
 
 REQUIRED_VARS = {
     "PROJECT_ID": PROJECT_ID,
@@ -73,14 +50,12 @@ worksheet = None
 
 if ANALYTICS_ENABLED:
     try:
-        # ⚠️ 现在约定：PRIVATE_KEY 已经是多行真换行的内容，不再做 "\\n" -> "\n" 的替换
-        fixed_private_key = PRIVATE_KEY
-
-        credentials_dict = {
+        # 这里 PRIVATE_KEY 已经是多行的真实 key，**不要再做 .replace("\\n", "\n")**
+        credentials_info = {
             "type": "service_account",
             "project_id": PROJECT_ID,
             "private_key_id": PRIVATE_KEY_ID,
-            "private_key": fixed_private_key,
+            "private_key": PRIVATE_KEY,
             "client_email": CLIENT_EMAIL,
             "client_id": CLIENT_ID,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
@@ -90,24 +65,22 @@ if ANALYTICS_ENABLED:
                 "https://www.googleapis.com/robot/v1/metadata/x509/"
                 + CLIENT_EMAIL.replace("@", "%40")
             ),
-            "universe_domain": "googleapis.com",
         }
 
         scopes = [
-            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
 
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            credentials_dict, scopes=scopes
+        creds = Credentials.from_service_account_info(
+            credentials_info,
+            scopes=scopes,
         )
         gc = gspread.authorize(creds)
 
-        # 打开你的表
         sh = gc.open_by_key(SHEET_ID)
         worksheet = sh.sheet1
 
-        # 如果是第一次使用，没有任何内容，则加上表头
         existing = worksheet.get_all_values()
         if not existing:
             worksheet.append_row(
@@ -115,22 +88,20 @@ if ANALYTICS_ENABLED:
                 value_input_option="USER_ENTERED",
             )
 
-        print("[analytics] Google Sheet analytics 已启用。")
+        print("[analytics] ✅ Google Sheet analytics 已启用。")
 
     except Exception as e:
         ANALYTICS_ENABLED = False
-        print(f"[analytics] 初始化失败，已关闭埋点功能: {e}")
+        print(f"[analytics] ❌ 初始化失败，已关闭埋点功能: {e}")
 else:
     missing = [k for k, v in REQUIRED_VARS.items() if not v]
     print(
-        "[analytics] 缺少必要配置，已关闭埋点功能。缺失字段: "
+        "[analytics] ⚠️ 缺少必要配置，已关闭埋点功能。缺失字段: "
         + ", ".join(missing)
     )
 
 
-# ---------------------------------------------------------
-# 2. 对外接口：log_event
-# ---------------------------------------------------------
+# ------------- 对外接口：log_event -------------
 
 def log_event(event_type: str, data: dict):
     """
@@ -147,5 +118,4 @@ def log_event(event_type: str, data: dict):
         row = [ts, event_type, data_json]
         worksheet.append_row(row, value_input_option="USER_ENTERED")
     except Exception as e:
-        # 不抛出异常，避免影响主流程；错误可以在日志里查看
         print(f"[analytics] 写入事件失败: {e}")
