@@ -1,98 +1,146 @@
-# analytics.py
-# 使用你在 secrets 中配置的 GOOGLE_SHEETS_* 写入同一张 Google Sheet
+"""
+analytics.py
+把 Streamlit 里的埋点写到 Google Sheet 里。
 
-from __future__ import annotations
+依赖的 Secrets 结构（已经和你现在的一致）：
 
+OPENAI_API_KEY = "..."
+MODEL_NAME = "gpt-4o-mini"
+
+GOOGLE_SHEETS_PROJECT_ID   = "resumeoptimizer-478323"
+GOOGLE_SHEETS_PRIVATE_KEY_ID = "493b09c9e0f2adcc68c9d53e45ced474c1c7332c"
+GOOGLE_SHEETS_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+GOOGLE_SHEETS_CLIENT_EMAIL = "resume-analytics@resumeoptimizer-478323.iam.gserviceaccount.com"
+GOOGLE_SHEETS_CLIENT_ID    = "115707362625148987470"
+GOOGLE_SHEETS_SHEET_ID     = "1mC0SC1-DTLXvljjlPM2JOOQi8Jrq0dKTxTgWCD65764"
+"""
+
+import os
 import json
+import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
 
-import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
-# 这两个是 requirements.txt 里已经装好的
+# 尝试和 Streamlit 的 session 绑定一个稳定的 session_id
 try:
-    import gspread
-    from google.oauth2.service_account import Credentials
+    import streamlit as st
 
-    _HAS_SHEETS = True
+    _USE_STREAMLIT = True
 except Exception:
-    _HAS_SHEETS = False
+    st = None
+    _USE_STREAMLIT = False
+
+# Google API 访问范围：只需要 Sheets 即可
+_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# 本地兜底的 session_id（在没有 Streamlit 的环境下用）
+_fallback_session_id = None
 
 
-def _build_service_account_info() -> Optional[dict]:
+def _get_session_id() -> str:
+    """返回一个在当前会话内稳定的 session_id"""
+    global _fallback_session_id
+
+    if _USE_STREAMLIT:
+        if "sid" not in st.session_state:
+            st.session_state["sid"] = str(uuid.uuid4())
+        return st.session_state["sid"]
+    else:
+        if _fallback_session_id is None:
+            _fallback_session_id = str(uuid.uuid4())
+        return _fallback_session_id
+
+
+def _build_credentials() -> Credentials:
     """
-    根据你现在的 secrets 结构，拼出一个 service_account_info dict，
-    用于 Credentials.from_service_account_info(...)
+    从拆开的 environment variables 里拼出 service_account 信息，
+    然后生成 google.oauth2.service_account.Credentials。
     """
-    required_keys = [
-        "GOOGLE_SHEETS_PROJECT_ID",
-        "GOOGLE_SHEETS_PRIVATE_KEY_ID",
-        "GOOGLE_SHEETS_PRIVATE_KEY",
-        "GOOGLE_SHEETS_CLIENT_EMAIL",
-        "GOOGLE_SHEETS_CLIENT_ID",
-    ]
-    for key in required_keys:
-        if key not in st.secrets:
-            return None
+    project_id = os.getenv("GOOGLE_SHEETS_PROJECT_ID")
+    private_key_id = os.getenv("GOOGLE_SHEETS_PRIVATE_KEY_ID")
+    private_key = os.getenv("GOOGLE_SHEETS_PRIVATE_KEY", "")
+    client_email = os.getenv("GOOGLE_SHEETS_CLIENT_EMAIL")
+    client_id = os.getenv("GOOGLE_SHEETS_CLIENT_ID")
 
-    return {
+    # 基本校验，避免静默失败
+    if not all([project_id, private_key_id, private_key, client_email, client_id]):
+        raise RuntimeError(
+            "Google Sheets 环境变量缺失：请检查是否配置了 "
+            "GOOGLE_SHEETS_PROJECT_ID / PRIVATE_KEY_ID / PRIVATE_KEY / "
+            "CLIENT_EMAIL / CLIENT_ID"
+        )
+
+    # Streamlit Secrets 里常常需要写成带 \n 的字符串，这里统一替换为真实换行
+    private_key = private_key.replace("\\n", "\n")
+
+    service_account_info = {
         "type": "service_account",
-        "project_id": st.secrets["GOOGLE_SHEETS_PROJECT_ID"],
-        "private_key_id": st.secrets["GOOGLE_SHEETS_PRIVATE_KEY_ID"],
-        "private_key": st.secrets["GOOGLE_SHEETS_PRIVATE_KEY"],
-        "client_email": st.secrets["GOOGLE_SHEETS_CLIENT_EMAIL"],
-        "client_id": st.secrets["GOOGLE_SHEETS_CLIENT_ID"],
-        # 这两个是固定写死的标准地址
+        "project_id": project_id,
+        "private_key_id": private_key_id,
+        "private_key": private_key,
+        "client_email": client_email,
+        "client_id": client_id,
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": (
+            "https://www.googleapis.com/robot/v1/metadata/x509/"
+            + client_email.replace("@", "%40")
+        ),
     }
+
+    creds = Credentials.from_service_account_info(
+        service_account_info, scopes=_SCOPES
+    )
+    return creds
 
 
 def _get_worksheet():
     """
-    返回 Google Sheet 的第一个工作表（Sheet1）。
-    配置不完整 / 依赖缺失时返回 None，不抛错。
+    拿到目标 Google Sheet 的第一个工作表（sheet1），
+    并保证第 1 行是我们预期的表头。
     """
-    if not _HAS_SHEETS:
-        return None
+    sheet_id = os.getenv("GOOGLE_SHEETS_SHEET_ID")
+    if not sheet_id:
+        raise RuntimeError("GOOGLE_SHEETS_SHEET_ID 未配置。")
 
-    if "GOOGLE_SHEETS_SHEET_ID" not in st.secrets:
-        return None
+    creds = _build_credentials()
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.sheet1
 
-    service_info = _build_service_account_info()
-    if service_info is None:
-        return None
-
+    # 如果 A1 不是我们预期的表头，就插入一行表头
+    headers = ["timestamp", "event_type", "session_id", "data_json"]
     try:
-        creds = Credentials.from_service_account_info(
-            service_info,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"],
-        )
-        client = gspread.authorize(creds)
-        sheet_id = st.secrets["GOOGLE_SHEETS_SHEET_ID"]
-        sh = client.open_by_key(sheet_id)
-        ws = sh.sheet1
-        return ws
-    except Exception as e:
-        # 不要让异常影响主程序，只在日志里打印一下
-        print("⚠ analytics: 无法连接 Google Sheet:", e)
-        return None
+        first_cell = ws.acell("A1").value
+    except Exception:
+        first_cell = None
+
+    if first_cell != headers[0]:
+        # 在最上面插入一行表头，把你之前那句“打开左上角日期选择器…”往下推一行
+        ws.insert_row(headers, 1)
+
+    return ws
 
 
-def log_event(event_type: str, data: Dict[str, Any] | None = None) -> None:
+def log_event(event_type: str, data: dict):
     """
-    供 app.py 调用的统一埋点入口。
-    你在 app.py 里通过 safe_log_event(...) 调用的就是这个函数。
-    每次调用会往 Google Sheet 追加一行：
-    [时间戳, 事件类型, JSON 格式的 data]
+    对外暴露的唯一接口：写一行日志到 Google Sheet。
+
+    event_type: "page_view" / "generate" / "user_feedback" 等
+    data:      任意可 JSON 序列化的 dict
     """
     ws = _get_worksheet()
-    if ws is None:
-        return
+    sid = _get_session_id()
 
-    try:
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        payload = json.dumps(data or {}, ensure_ascii=False)
-        ws.append_row([ts, event_type, payload], value_input_option="RAW")
-    except Exception as e:
-        print("⚠ analytics: 写入日志失败:", e)
-        return
+    row = [
+        datetime.utcnow().isoformat(),
+        event_type,
+        sid,
+        json.dumps(data, ensure_ascii=False),
+    ]
+
+    # 使用 USER_ENTERED，让时间和数字在 Sheet 里显示得更自然
+    ws.append_row(row, value_input_option="USER_ENTERED")
