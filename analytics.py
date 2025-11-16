@@ -1,151 +1,98 @@
 # analytics.py
+# 使用你在 secrets 中配置的 GOOGLE_SHEETS_* 写入同一张 Google Sheet
+
+from __future__ import annotations
+
 import json
 from datetime import datetime
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Optional
 
-import gspread
-from google.oauth2.service_account import Credentials
+import streamlit as st
 
-# 下面这几个全局变量用来缓存 Google Sheet 连接
-_gs_client: Optional[gspread.Client] = None
-_usage_ws: Optional[gspread.Worksheet] = None
-_feedback_ws: Optional[gspread.Worksheet] = None
-_error_ws: Optional[gspread.Worksheet] = None
+# 这两个是 requirements.txt 里已经装好的
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
 
-
-def _now_str() -> str:
-    """统一的时间格式（UTC+0），方便在表里看。"""
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    _HAS_SHEETS = True
+except Exception:
+    _HAS_SHEETS = False
 
 
-def init_analytics(secrets) -> Tuple[bool, str]:
+def _build_service_account_info() -> Optional[dict]:
     """
-    初始化 Google Sheet 分析写入。
-    - secrets: 一般传入的是 st.secrets
-    - 返回 (ok, message)
-        ok = True  表示初始化成功
-        ok = False 表示失败，message 里带原因（给 UI 用）
+    根据你现在的 secrets 结构，拼出一个 service_account_info dict，
+    用于 Credentials.from_service_account_info(...)
     """
-    global _gs_client, _usage_ws, _feedback_ws, _error_ws
+    required_keys = [
+        "GOOGLE_SHEETS_PROJECT_ID",
+        "GOOGLE_SHEETS_PRIVATE_KEY_ID",
+        "GOOGLE_SHEETS_PRIVATE_KEY",
+        "GOOGLE_SHEETS_CLIENT_EMAIL",
+        "GOOGLE_SHEETS_CLIENT_ID",
+    ]
+    for key in required_keys:
+        if key not in st.secrets:
+            return None
 
-    # 1) 取 JSON 配置
+    return {
+        "type": "service_account",
+        "project_id": st.secrets["GOOGLE_SHEETS_PROJECT_ID"],
+        "private_key_id": st.secrets["GOOGLE_SHEETS_PRIVATE_KEY_ID"],
+        "private_key": st.secrets["GOOGLE_SHEETS_PRIVATE_KEY"],
+        "client_email": st.secrets["GOOGLE_SHEETS_CLIENT_EMAIL"],
+        "client_id": st.secrets["GOOGLE_SHEETS_CLIENT_ID"],
+        # 这两个是固定写死的标准地址
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+
+
+def _get_worksheet():
+    """
+    返回 Google Sheet 的第一个工作表（Sheet1）。
+    配置不完整 / 依赖缺失时返回 None，不抛错。
+    """
+    if not _HAS_SHEETS:
+        return None
+
+    if "GOOGLE_SHEETS_SHEET_ID" not in st.secrets:
+        return None
+
+    service_info = _build_service_account_info()
+    if service_info is None:
+        return None
+
     try:
-        json_str = secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    except Exception:
-        return False, "未在 secrets 中找到 GOOGLE_SERVICE_ACCOUNT_JSON"
-
-    if not json_str:
-        return False, "GOOGLE_SERVICE_ACCOUNT_JSON 为空"
-
-    # 2) 解析 JSON
-    try:
-        info = json.loads(json_str)
-    except Exception as e:
-        return False, f"GOOGLE_SERVICE_ACCOUNT_JSON 解析失败: {e}"
-
-    # 3) 取 Sheet ID
-    try:
-        sheet_id = secrets.get("GOOGLE_SHEET_ID", "")
-    except Exception:
-        return False, "未在 secrets 中找到 GOOGLE_SHEET_ID"
-
-    if not sheet_id:
-        return False, "GOOGLE_SHEET_ID 为空"
-
-    # 4) 构造凭证 & 客户端
-    try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        creds = Credentials.from_service_account_info(
+            service_info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
         client = gspread.authorize(creds)
+        sheet_id = st.secrets["GOOGLE_SHEETS_SHEET_ID"]
         sh = client.open_by_key(sheet_id)
-    except Exception as e:
-        return False, f"连接 Google Sheet 失败: {e}"
-
-    # 5) 获取 / 创建 worksheet
-    def _get_or_create_ws(title: str, headers) -> gspread.Worksheet:
-        try:
-            ws = sh.worksheet(title)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=title, rows=1000, cols=len(headers))
-            ws.append_row(headers)
+        ws = sh.sheet1
         return ws
-
-    try:
-        _gs_client = client
-        _usage_ws = _get_or_create_ws(
-            "usage",
-            ["timestamp", "session_id", "event", "detail_json"],
-        )
-        _feedback_ws = _get_or_create_ws(
-            "feedback",
-            ["timestamp", "session_id", "contact", "type", "content_json"],
-        )
-        _error_ws = _get_or_create_ws(
-            "errors",
-            ["timestamp", "session_id", "where", "error_msg"],
-        )
     except Exception as e:
-        return False, f"初始化 worksheet 失败: {e}"
-
-    return True, "Analytics 已启用"
-
-
-def log_event(event: str, session_id: str, detail: Dict[str, Any]):
-    """记录一次使用事件到 usage 表。"""
-    if _usage_ws is None:
-        return  # Analytics 未启用就直接返回，不打断主流程
-    try:
-        _usage_ws.append_row(
-            [
-                _now_str(),
-                session_id,
-                event,
-                json.dumps(detail, ensure_ascii=False),
-            ]
-        )
-    except Exception:
-        # 不要让任何异常影响主流程
-        pass
+        # 不要让异常影响主程序，只在日志里打印一下
+        print("⚠ analytics: 无法连接 Google Sheet:", e)
+        return None
 
 
-def log_feedback(
-    session_id: str,
-    contact: str,
-    fb_type: str,
-    content: Dict[str, Any],
-):
-    """记录用户反馈到 feedback 表。"""
-    if _feedback_ws is None:
+def log_event(event_type: str, data: Dict[str, Any] | None = None) -> None:
+    """
+    供 app.py 调用的统一埋点入口。
+    你在 app.py 里通过 safe_log_event(...) 调用的就是这个函数。
+    每次调用会往 Google Sheet 追加一行：
+    [时间戳, 事件类型, JSON 格式的 data]
+    """
+    ws = _get_worksheet()
+    if ws is None:
         return
+
     try:
-        _feedback_ws.append_row(
-            [
-                _now_str(),
-                session_id,
-                contact,
-                fb_type,
-                json.dumps(content, ensure_ascii=False),
-            ]
-        )
-    except Exception:
-        pass
-
-
-def log_error(session_id: str, where: str, error_msg: str):
-    """如果你愿意，也可以在主代码里捕获异常写到 errors 表。"""
-    if _error_ws is None:
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        payload = json.dumps(data or {}, ensure_ascii=False)
+        ws.append_row([ts, event_type, payload], value_input_option="RAW")
+    except Exception as e:
+        print("⚠ analytics: 写入日志失败:", e)
         return
-    try:
-        _error_ws.append_row(
-            [
-                _now_str(),
-                session_id,
-                where,
-                error_msg,
-            ]
-        )
-    except Exception:
-        pass
