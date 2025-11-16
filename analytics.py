@@ -1,100 +1,119 @@
 # analytics.py
+"""
+简单的埋点工具：
+- 使用 gspread + service account 写入 Google Sheet
+- 读取的是分字段的 Secrets：
+  GOOGLE_SHEETS_PROJECT_ID
+  GOOGLE_SHEETS_PRIVATE_KEY_ID
+  GOOGLE_SHEETS_PRIVATE_KEY
+  GOOGLE_SHEETS_CLIENT_EMAIL
+  GOOGLE_SHEETS_CLIENT_ID
+  GOOGLE_SHEETS_SHEET_ID
+"""
+
 import os
 import json
 from datetime import datetime
 
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 
 # ---------------------------------------------------------
-# 读取 Streamlit Secrets 中的环境变量，拼成 service account
+# 1. 读取环境变量（对应 Streamlit Secrets）
 # ---------------------------------------------------------
-def _build_service_account_info():
-    project_id = os.getenv("GOOGLE_SHEETS_PROJECT_ID")
-    private_key_id = os.getenv("GOOGLE_SHEETS_PRIVATE_KEY_ID")
-    private_key = os.getenv("GOOGLE_SHEETS_PRIVATE_KEY")
-    client_email = os.getenv("GOOGLE_SHEETS_CLIENT_EMAIL")
-    client_id = os.getenv("GOOGLE_SHEETS_CLIENT_ID")
 
-    # 任意一个缺失，就直接抛异常，后面会把 ANALYTICS_READY 设成 False
-    if not all([project_id, private_key_id, private_key, client_email, client_id]):
-        raise RuntimeError("Google Sheets 环境变量缺失，请检查 secrets 配置。")
+PROJECT_ID = os.getenv("GOOGLE_SHEETS_PROJECT_ID")
+PRIVATE_KEY_ID = os.getenv("GOOGLE_SHEETS_PRIVATE_KEY_ID")
+PRIVATE_KEY = os.getenv("GOOGLE_SHEETS_PRIVATE_KEY")
+CLIENT_EMAIL = os.getenv("GOOGLE_SHEETS_CLIENT_EMAIL")
+CLIENT_ID = os.getenv("GOOGLE_SHEETS_CLIENT_ID")
+SHEET_ID = os.getenv("GOOGLE_SHEETS_SHEET_ID")
 
-    # 如果在 secrets 里是用 \n 存的，这里转回真正的换行
-    private_key = private_key.replace("\\n", "\n")
+REQUIRED_VARS = [
+    PROJECT_ID,
+    PRIVATE_KEY_ID,
+    PRIVATE_KEY,
+    CLIENT_EMAIL,
+    CLIENT_ID,
+    SHEET_ID,
+]
 
-    # 按 Google service account 标准结构拼 JSON
-    info = {
-        "type": "service_account",
-        "project_id": project_id,
-        "private_key_id": private_key_id,
-        "private_key": private_key,
-        "client_email": client_email,
-        "client_id": client_id,
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_x509_cert_url": (
-            "https://www.googleapis.com/robot/v1/metadata/x509/"
-            + client_email.replace("@", "%40")
-        ),
-    }
-    return info
+ANALYTICS_ENABLED = all(REQUIRED_VARS)
 
+gc = None
+worksheet = None
 
-def _get_sheet():
-    """初始化 gspread client + 打开第一个工作表"""
-    service_info = _build_service_account_info()
+if ANALYTICS_ENABLED:
+    try:
+        # 注意：private_key 在 secrets 里是带 \n 的，需要还原成真正的换行
+        fixed_private_key = PRIVATE_KEY.replace("\\n", "\n")
 
-    creds = Credentials.from_service_account_info(
-        service_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
+        credentials_dict = {
+            "type": "service_account",
+            "project_id": PROJECT_ID,
+            "private_key_id": PRIVATE_KEY_ID,
+            "private_key": fixed_private_key,
+            "client_email": CLIENT_EMAIL,
+            "client_id": CLIENT_ID,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": (
+                "https://www.googleapis.com/robot/v1/metadata/x509/"
+                + CLIENT_EMAIL.replace("@", "%40")
+            ),
+            "universe_domain": "googleapis.com",
+        }
 
-    gc = gspread.authorize(creds)
+        scopes = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
 
-    sheet_id = os.getenv("GOOGLE_SHEETS_SHEET_ID")
-    if not sheet_id:
-        raise RuntimeError("GOOGLE_SHEETS_SHEET_ID 未配置。")
-
-    sh = gc.open_by_key(sheet_id)
-    worksheet = sh.sheet1  # 默认第一个 sheet，名称“工作表1”
-    return worksheet
-
-
-# 尝试初始化，全局复用一个 worksheet 对象
-try:
-    _sheet = _get_sheet()
-
-    # 如果第一行是空的，就写上表头
-    first_row = _sheet.row_values(1)
-    if not first_row:
-        _sheet.append_row(
-            ["ts_utc", "event_type", "payload_json"],
-            value_input_option="RAW",
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            credentials_dict, scopes=scopes
         )
+        gc = gspread.authorize(creds)
 
-    ANALYTICS_READY = True
-except Exception as e:
-    # 这里不要抛出到页面，只是标记为不可用
-    ANALYTICS_READY = False
-    _sheet = None
-    # 如需调试，可以暂时打印：
-    # import traceback; traceback.print_exc()
+        # 打开你的表
+        sh = gc.open_by_key(SHEET_ID)
+        worksheet = sh.sheet1
 
+        # 如果是第一次使用，没有任何内容，则加上表头
+        existing = worksheet.get_all_values()
+        if not existing:
+            worksheet.append_row(
+                ["timestamp_utc", "event_type", "data_json"],
+                value_input_option="USER_ENTERED",
+            )
+
+        print("[analytics] Google Sheet analytics 已启用。")
+
+    except Exception as e:
+        ANALYTICS_ENABLED = False
+        print(f"[analytics] 初始化失败，已关闭埋点功能: {e}")
+else:
+    print("[analytics] 缺少必要的 GOOGLE_SHEETS_* 环境变量，已关闭埋点功能。")
+
+
+# ---------------------------------------------------------
+# 2. 对外接口：log_event
+# ---------------------------------------------------------
 
 def log_event(event_type: str, data: dict):
-    """供 app.py 调用的统一埋点方法"""
-    if not ANALYTICS_READY or _sheet is None:
+    """
+    记录一条事件到 Google Sheet。
+    event_type: "page_view" / "generate" / "user_feedback" 等
+    data: 任意可 JSON 序列化的字典
+    """
+    if not ANALYTICS_ENABLED or worksheet is None:
         return
 
     try:
         ts = datetime.utcnow().isoformat()
-        payload_str = json.dumps(data, ensure_ascii=False)
-        _sheet.append_row(
-            [ts, event_type, payload_str],
-            value_input_option="RAW",
-        )
-    except Exception:
-        # 为了不影响主流程，这里也静默失败，如需调试可以打印异常
-        pass
+        data_json = json.dumps(data, ensure_ascii=False)
+        row = [ts, event_type, data_json]
+        worksheet.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        # 不抛出异常，避免影响主流程；错误可以在日志里查看
+        print(f"[analytics] 写入事件失败: {e}")
