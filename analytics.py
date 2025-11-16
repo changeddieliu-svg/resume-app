@@ -18,27 +18,52 @@ from datetime import datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
+# 关键：同时支持环境变量 和 st.secrets
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+
+def _get_secret(name: str) -> str | None:
+    """
+    优先从环境变量取；如果取不到，再尝试 st.secrets.
+    这样无论你是用 Streamlit Secrets 还是 Docker/env，都能兼容。
+    """
+    value = os.getenv(name)
+    if value:
+        return value
+
+    if st is not None:
+        try:
+            # Streamlit Secrets 是个 dict-like
+            return st.secrets.get(name)
+        except Exception:
+            return None
+    return None
+
+
 # ---------------------------------------------------------
-# 1. 读取环境变量（对应 Streamlit Secrets）
+# 1. 读取配置（对应 Streamlit Secrets）
 # ---------------------------------------------------------
 
-PROJECT_ID = os.getenv("GOOGLE_SHEETS_PROJECT_ID")
-PRIVATE_KEY_ID = os.getenv("GOOGLE_SHEETS_PRIVATE_KEY_ID")
-PRIVATE_KEY = os.getenv("GOOGLE_SHEETS_PRIVATE_KEY")
-CLIENT_EMAIL = os.getenv("GOOGLE_SHEETS_CLIENT_EMAIL")
-CLIENT_ID = os.getenv("GOOGLE_SHEETS_CLIENT_ID")
-SHEET_ID = os.getenv("GOOGLE_SHEETS_SHEET_ID")
+PROJECT_ID = _get_secret("GOOGLE_SHEETS_PROJECT_ID")
+PRIVATE_KEY_ID = _get_secret("GOOGLE_SHEETS_PRIVATE_KEY_ID")
+PRIVATE_KEY = _get_secret("GOOGLE_SHEETS_PRIVATE_KEY")
+CLIENT_EMAIL = _get_secret("GOOGLE_SHEETS_CLIENT_EMAIL")
+CLIENT_ID = _get_secret("GOOGLE_SHEETS_CLIENT_ID")
+SHEET_ID = _get_secret("GOOGLE_SHEETS_SHEET_ID")
 
-REQUIRED_VARS = [
-    PROJECT_ID,
-    PRIVATE_KEY_ID,
-    PRIVATE_KEY,
-    CLIENT_EMAIL,
-    CLIENT_ID,
-    SHEET_ID,
-]
+REQUIRED_VARS = {
+    "PROJECT_ID": PROJECT_ID,
+    "PRIVATE_KEY_ID": PRIVATE_KEY_ID,
+    "PRIVATE_KEY": PRIVATE_KEY,
+    "CLIENT_EMAIL": CLIENT_EMAIL,
+    "CLIENT_ID": CLIENT_ID,
+    "SHEET_ID": SHEET_ID,
+}
 
-ANALYTICS_ENABLED = all(REQUIRED_VARS)
+ANALYTICS_ENABLED = all(REQUIRED_VARS.values())
 
 gc = None
 worksheet = None
@@ -93,7 +118,11 @@ if ANALYTICS_ENABLED:
         ANALYTICS_ENABLED = False
         print(f"[analytics] 初始化失败，已关闭埋点功能: {e}")
 else:
-    print("[analytics] 缺少必要的 GOOGLE_SHEETS_* 环境变量，已关闭埋点功能。")
+    missing = [k for k, v in REQUIRED_VARS.items() if not v]
+    print(
+        "[analytics] 缺少必要配置，已关闭埋点功能。缺失字段: "
+        + ", ".join(missing)
+    )
 
 
 # ---------------------------------------------------------
