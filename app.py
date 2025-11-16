@@ -1,26 +1,27 @@
-import io
 import os
-import re
-from typing import Tuple
+import io
+from uuid import uuid4
+from datetime import datetime
 
 import streamlit as st
 from openai import OpenAI
+from langdetect import detect
+
 import pdfplumber
 from docx import Document
 
-# OCR 相关（可选）
-try:
-    from pdf2image import convert_from_bytes
-    import pytesseract
+# ============ Streamlit 基础配置（必须是第一个 st 调用） ============
+st.set_page_config(
+    page_title="AI 智能简历优化",
+    page_icon="🧠",
+    layout="wide",
+)
 
-    HAS_OCR = True
-except Exception:
-    HAS_OCR = False
-
-# ============== Analytics 安全导入 ==============
+# ============ 安全导入 analytics（Google Sheet & Slack） ============
 try:
     from analytics import log_event, log_feedback, log_error
 except Exception:
+    # 如果 analytics 还没配置好，不阻塞正常功能
     def log_event(*args, **kwargs):
         pass
 
@@ -31,424 +32,375 @@ except Exception:
         pass
 
 
-# ============== OpenAI 客户端 ==============
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+# ============ OpenAI 客户端 ============
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    client = None
+
+# ============ Session 级别信息 ============
+if "sid" not in st.session_state:
+    st.session_state["sid"] = str(uuid4())
+
+SESSION_ID = st.session_state["sid"]
+
+# 首次打开页面埋点
+log_event(
+    "page_view",
+    {
+        "sid": SESSION_ID,
+        "ts": datetime.utcnow().isoformat(),
+        "page": "resume_optimizer",
+    },
+)
 
 
-# ============== 工具函数 ==============
-
-def detect_language(text: str) -> str:
-    """非常轻量级的语言检测：统计中文字符占比，粗略判断中/英文。"""
-    if not text:
-        return "auto"
-
-    chinese_chars = re.findall(r"[\u4e00-\u9fff]", text)
-    ratio = len(chinese_chars) / max(len(text), 1)
-
-    return "zh" if ratio > 0.15 else "en"
-
+# ============ 一些工具函数 ============
 
 def read_docx(file_bytes: bytes) -> str:
-    doc = Document(io.BytesIO(file_bytes))
-    paragraphs = [p.text for p in doc.paragraphs]
-    return "\n".join(p for p in paragraphs if p.strip())
+    bio = io.BytesIO(file_bytes)
+    doc = Document(bio)
+    lines = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
 
 
-def read_pdf(file_bytes: bytes, use_ocr: bool = False) -> str:
-    text = ""
+def read_pdf(file_bytes: bytes) -> str:
+    text_chunks = []
+    bio = io.BytesIO(file_bytes)
+    with pdfplumber.open(bio) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            t = t.strip()
+            if t:
+                text_chunks.append(t)
+    return "\n\n".join(text_chunks)
 
-    # 先尝试用 pdfplumber 直接抽取文本
+
+def detect_lang(text: str) -> str:
     try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
+        lang = detect(text)
+        if lang.startswith("zh"):
+            return "zh"
+        else:
+            return "en"
     except Exception:
-        text = ""
-
-    # 如果没抽到内容、并且用户勾选了 OCR，并且依赖可用，再走 OCR
-    if use_ocr and HAS_OCR:
-        try:
-            images = convert_from_bytes(file_bytes)
-            ocr_texts = []
-            for img in images:
-                ocr_texts.append(pytesseract.image_to_string(img))
-            text = "\n".join(ocr_texts)
-        except Exception as e:
-            log_error("ocr_failed", e)
-
-    return text.strip()
+        # 默认中文
+        return "zh"
 
 
 def build_prompt(
-    base_cv: str,
-    jd_or_instructions: str,
-    refine_focus: list,
+    cv_text: str,
+    jd_text: str,
+    focus_tags,
     custom_points: str,
     need_cover_letter: bool,
-    lang: str,
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     """
-    返回： (cv_prompt, cover_letter_prompt)
-    cover_letter_prompt 可能为空字符串（当不需要生成求职信时）
+    返回 (system_prompt, user_prompt)
     """
+    lang = detect_lang(cv_text + "\n" + jd_text)
+
     if lang == "zh":
-        lang_tag = "Chinese"
-        cv_title = "优化后的简历"
-        cv_require = (
-            "请在不虚构经历的前提下，优化结构、量化成果、突出与目标岗位匹配的经历，语言保持自然专业。"
+        system_prompt = (
+            "你是一名资深求职顾问，擅长根据候选人的简历与目标职位 JD，"
+            "提升简历匹配度与专业度，同时在需要时撰写高质量求职信。"
+            "你需要在保留事实真实性的前提下，优化表述、量化成果、突出与 JD 的匹配度。"
         )
-        cl_title = "求职信"
-        cl_require = (
-            "语言自然真诚、专业，控制在 3–6 段落，适合直接投递使用。"
-        )
+        focus_text = "、".join(focus_tags) if focus_tags else "综合优化"
+        user_prompt = f"""
+【任务语言】请全程使用与候选人简历相同的语言（当前自动识别为：{"中文" if lang=="zh" else "英文"}）。
+
+【优化重点】{focus_text}
+
+【候选人原始简历】
+{cv_text}
+
+【目标职位 JD 或 特别优化指令】
+{jd_text}
+
+【自定义增强点（如果为空可以忽略）】
+{custom_points or "（无）"}
+
+【输出要求】
+1. 先输出【优化后简历】，按照常见简历结构分段：
+   - 个人信息（不要虚构联系方式）
+   - 教育背景
+   - 实习 / 工作经历（每段经历用要点列出，突出职责 + 量化成果 + 使用技能）
+   - 项目经历（如有）
+   - 技能 & 证书
+2. 请特别注意：
+   - 不要虚构并不存在的公司、学校、证书或日期；
+   - 可以对已有经历进行更专业的表达和重组；
+   - 尽量保留原本的关键信息，但避免啰嗦。
+3. 如果用户勾选了生成求职信，请在最后再输出一个【求职信】模块：
+   - 用 1~1.5 页左右篇幅；
+   - 说明候选人与该职位的匹配度、代表性经历和动机。
+4. 输出格式用清晰的小标题和项目符号，适合直接复制到 Word 中使用。
+"""
     else:
-        lang_tag = "English"
-        cv_title = "Optimized CV"
-        cv_require = (
-            "Do not fabricate experience. Improve structure, quantify impact, "
-            "and highlight alignment with the target role in natural, professional English."
+        system_prompt = (
+            "You are an experienced career consultant. "
+            "Given a candidate's CV and a target job description, "
+            "you will rewrite and improve the CV to better match the role, "
+            "while keeping all information truthful. "
+            "Optionally, you will also draft a tailored cover letter."
         )
-        cl_title = "Cover Letter"
-        cl_require = (
-            "Use a natural, professional tone in English, 3–6 paragraphs, ready to send."
-        )
+        focus_text = ", ".join(focus_tags) if focus_tags else "overall optimisation"
+        user_prompt = f"""
+[Language] Please respond in the same language as the candidate's CV (currently detected as: {"Chinese" if lang=="zh" else "English"}).
 
-    refine_str = ", ".join(refine_focus) if refine_focus else ""
-    custom_str = custom_points.strip()
+[Focus]
+{focus_text}
 
-    extra_instruction_parts = []
-    if refine_str:
-        extra_instruction_parts.append(f"Refinement focus: {refine_str}")
-    if custom_str:
-        extra_instruction_parts.append(f"Custom requirements: {custom_str}")
-    if jd_or_instructions.strip():
-        extra_instruction_parts.append(
-            f"Target JD / optimization instructions:\n{jd_or_instructions.strip()}"
-        )
+[Original CV]
+{cv_text}
 
-    extra_block = "\n\n".join(extra_instruction_parts) if extra_instruction_parts else ""
+[Target Job Description or Extra Instructions]
+{jd_text}
 
-    cv_prompt = f"""
-You are an expert {lang_tag} CV writer and career coach.
+[Custom Emphasis / Extra Points]
+{custom_points or "(none)"}
 
-User's current CV:
--------------------
-{base_cv}
--------------------
+[Output Requirements]
+1. First output an **Improved CV**:
+   - Use standard sections (Profile, Education, Experience, Projects, Skills, Certifications, etc.).
+   - For each experience, use bullet points focusing on responsibilities + quantified impact + skills/tech stack.
+   - Do NOT fabricate employers, schools, degrees, or dates.
+2. You may rephrase and reorganise content for clarity and impact, but do not invent fake achievements.
+3. If the user has requested a cover letter, then add a **Cover Letter** section at the end:
+   - About 1 page.
+   - Clearly link the candidate's experience to the role requirements.
+4. Make the structure easy to copy-paste into Word.
+"""
 
-{extra_block}
+    if not need_cover_letter:
+        # 提醒模型可以忽略求职信部分
+        if lang == "zh":
+            user_prompt += "\n（本次用户没有勾选生成求职信，如无特别需要可省略【求职信】模块。）"
+        else:
+            user_prompt += "\n(The user did NOT request a cover letter this time; you may omit the Cover Letter section.)"
 
-Task:
-Generate a rewritten version of the CV in {lang_tag}.
-- Keep all experience factually true.
-- Reorganize content for clarity.
-- Quantify achievements where possible.
-- Strongly highlight relevance to the target role.
-- Return ONLY the final CV content, with clear sections (e.g. Education / Experience / Skills),
-  without markdown bold syntax (** **) or bullet symbols that will break formatting in DOCX.
-- Keep line breaks clean so that it can be safely placed into a Word document.
-
-Output language: {lang_tag}
-Title for the user (do NOT include in your output): {cv_title}
-
-{cv_require}
-""".strip()
-
-    cover_letter_prompt = ""
-    if need_cover_letter:
-        cover_letter_prompt = f"""
-You are an expert {lang_tag} cover letter writer.
-
-User's current CV:
--------------------
-{base_cv}
--------------------
-
-{extra_block}
-
-Task:
-Write a tailored cover letter in {lang_tag} for this candidate, suitable for the target role.
-- Tie the candidate's experience to the JD.
-- Adopt a natural, confident but not exaggerated tone.
-- 3–6 paragraphs.
-- Do NOT wrap text with markdown symbols (** or *), output plain text only.
-- Start with an appropriate greeting and end with a professional closing.
-
-Output language: {lang_tag}
-Title for the user (do NOT include in your output): {cl_title}
-
-{cl_require}
-""".strip()
-
-    return cv_prompt, cover_letter_prompt
+    return system_prompt, user_prompt
 
 
-def call_openai(prompt: str, lang: str) -> str:
-    """调用 OpenAI 生成文本。"""
-    if not client.api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
+def call_openai(cv_text: str, jd_text: str, focus_tags, custom_points: str, need_cover_letter: bool) -> str:
+    if not client:
+        raise RuntimeError("OpenAI client not initialised. Please check OPENAI_API_KEY in Secrets.")
 
-    system_msg = (
-        "You are a helpful assistant for CV and cover letter rewriting." if lang == "en"
-        else "你是一名专业的人力资源与职业教练专家，专门帮助候选人优化简历和求职信。"
+    system_prompt, user_prompt = build_prompt(
+        cv_text=cv_text,
+        jd_text=jd_text,
+        focus_tags=focus_tags,
+        custom_points=custom_points,
+        need_cover_letter=need_cover_letter,
     )
 
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
-        temperature=0.5,
+        temperature=0.4,
     )
     return resp.choices[0].message.content.strip()
 
 
-def export_docx(text: str, title: str) -> bytes:
-    """将纯文本写入 DOCX 并返回字节。避免复杂格式导致奇怪符号。"""
+def make_docx(text: str) -> bytes:
+    """将纯文本写入一个简单的 docx，返回二进制内容。"""
     doc = Document()
-    for line in text.split("\n"):
-        # 去掉多余空行
-        if line.strip():
-            doc.add_paragraph(line.strip())
-        else:
-            doc.add_paragraph("")
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.read()
+    for block in text.split("\n\n"):
+        p = doc.add_paragraph()
+        for line in block.split("\n"):
+            p.add_run(line)
+        # 额外空行交给 split 处理
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.read()
 
 
-# ============== 页面 & UI ==============
+# ============ UI 布局 ============
 
-st.set_page_config(
-    page_title="AI 智能简历优化",
-    page_icon="🧠",
-    layout="wide",
-)
-
-# 隐藏 streamlit 默认菜单、footer，并减小顶部空白
-st.markdown(
-    """
-    <style>
-    /* 隐藏右上角菜单与左上角汉堡 / 页脚 */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-
-    /* 整体页面稍微上移，减少顶部留白 */
-    .block-container {
-        padding-top: 1rem;
-        padding-bottom: 2rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# 日志：页面浏览
-log_event("page_view", {"page": "resume_optimizer"})
-
-# 左右布局
-sidebar = st.sidebar
-main_col, right_col = st.columns([1.2, 2.0])
-
-# ========== 左侧：设置 ==========
-
-with sidebar:
+# 左侧侧边栏
+with st.sidebar:
     st.markdown("### 设置")
-    st.caption("（左侧选项仅影响生成的强调方向）")
 
-    refine_focus = st.multiselect(
-        "精修侧重（可多选）",
-        options=[
-            "业务影响",
-            "沟通协作",
-            "数据分析 / 建模",
-            "项目管理",
-            "领导力 / 主动性",
-            "求职方向：量化 / 咨询 / 科技 / 银行",
-        ],
-        default=["业务影响"],
-    )
+    st.caption("（左侧选项仅影响生成时的强调方向）")
+
+    focus_options = ["业务影响", "沟通协作", "技术深度", "数据分析", "领导力潜力"]
+    focus_tags = st.multiselect("精修侧重（可多选）", focus_options, default=["业务影响"])
 
     custom_points = st.text_area(
         "增强点（可自定义）",
-        value=(
-            "例如：强调数据分析/量化成果；突出与目标岗位的匹配；或写作风格要求等…"
-        ),
+        value="例如：强调数据分析/量化成果；突出与目标岗位的匹配；或写作风格要求等…",
         height=120,
     )
 
-    generate_cover_letter = st.checkbox("生成求职信（Cover Letter）", value=True)
+    need_cover_letter = st.checkbox("生成求职信（Cover Letter）", value=True)
 
-    use_ocr = st.checkbox("启用 OCR（扫描 PDF）", value=False)
-    if use_ocr and not HAS_OCR:
-        st.info("当前环境未安装 OCR 依赖（pdf2image / pytesseract），将仅使用普通 PDF 文本抽取。")
+    enable_ocr = st.checkbox("启用 OCR（扫描 PDF）", value=False)
 
-    st.markdown("---")
     st.caption("仅供个人求职使用，禁止商用与爬取。")
 
+# 右侧主区域
+st.markdown("## 🧠 AI 智能简历优化")
 
-# ========== 中间主区域 ==========
+st.markdown(
+    "上传简历，AI 将根据 JD 一键优化；可选生成求职信（Cover Letter，语言自动随简历）。"
+)
 
-with main_col:
-    st.markdown("## 🧠 AI 智能简历优化")
+col_left, col_right = st.columns([1.05, 1.0])
 
-    st.markdown(
-        "上传简历，AI 将根据 JD 一键优化；可选生成求职信（Cover Letter，语言自动随简历）。"
-    )
-
+with col_left:
+    st.markdown("#### 上传简历（PDF 或 DOCX）")
     uploaded_file = st.file_uploader(
-        "上传简历（PDF 或 DOCX）",
+        "Drag and drop file here",
         type=["pdf", "docx"],
-        help="支持 PDF / DOCX，单文件 ≤ 50MB；扫描件可启用 OCR。",
-        label_visibility="visible",
+        label_visibility="collapsed",
     )
+    st.caption("支持 PDF / DOCX，单文件 ≤ 50MB；扫描件可启用 OCR。")
 
-    st.caption("支持 PDF / DOCX · 单文件 ≤ 50MB · 扫描件可启用 OCR")
-
-with right_col:
-    jd_input = st.text_area(
-        "粘贴目标职位 JD 或优化指令（可批量、用分隔）",
-        value=(
-            "例如：Actuarial graduate role at Deloitte. "
-            "请重点突出数据分析与建模能力；写作风格正式。Cover Letter 要更正式。"
-        ),
+with col_right:
+    st.markdown("#### 粘贴目标职位 JD 或 优化指令（可批量、用分隔）")
+    jd_text = st.text_area(
+        "例如：Actuarial graduate role at Deloitte. 也可以直接写优化指令（如强调哪些技能、写作风格等）",
         height=200,
+        label_visibility="collapsed",
     )
 
-# 提示区域 & 一键生成按钮
 st.markdown("---")
-st.info(
-    "💡 提示：可在左侧设置“精修侧重/增强点”；若 PDF 为扫描件，可开启 OCR。"
-)
+st.info("💡 提示：可在左侧设置“精修侧重/增强点”；若 PDF 为扫描件，可开启 OCR。")
 
-generate_clicked = st.button("🚀 一键生成", use_container_width=True)
-
-# 结果展示区占位
-result_cv = None
-result_cl = None
-
-if generate_clicked:
-    log_event("generate_click")
-
-    if uploaded_file is None:
-        st.error("请先上传一份 PDF 或 DOCX 简历。")
-    else:
-        try:
-            # 文件大小检查（50MB）
-            file_bytes = uploaded_file.read()
-            size_mb = len(file_bytes) / (1024 * 1024)
-            if size_mb > 50:
-                st.error("上传文件超过 50MB，请压缩或精简后再上传。")
-                log_event("file_too_large", {"size_mb": size_mb})
-            else:
-                suffix = uploaded_file.name.lower().split(".")[-1]
-
-                with st.spinner("正在读取简历内容…"):
-                    if suffix == "docx":
-                        base_cv_text = read_docx(file_bytes)
-                    elif suffix == "pdf":
-                        base_cv_text = read_pdf(file_bytes, use_ocr=use_ocr)
-                    else:
-                        st.error("仅支持 PDF 或 DOCX 文件。")
-                        base_cv_text = ""
-
-                if not base_cv_text.strip():
-                    st.error("未能从简历中读取到有效文本，请确认文件内容或尝试启用 OCR。")
-                    log_event("empty_cv_text", {"filetype": suffix})
-                else:
-                    lang = detect_language(base_cv_text)
-                    cv_prompt, cl_prompt = build_prompt(
-                        base_cv=base_cv_text,
-                        jd_or_instructions=jd_input,
-                        refine_focus=refine_focus,
-                        custom_points=custom_points,
-                        need_cover_letter=generate_cover_letter,
-                        lang=lang,
-                    )
-
-                    with st.spinner("AI 正在优化你的简历…"):
-                        cv_text = call_openai(cv_prompt, lang)
-                        result_cv = cv_text
-
-                    if generate_cover_letter and cl_prompt:
-                        with st.spinner("AI 正在撰写求职信…"):
-                            cl_text = call_openai(cl_prompt, lang)
-                            result_cl = cl_text
-
-                    log_event(
-                        "generate_success",
-                        {
-                            "lang": lang,
-                            "has_cover_letter": bool(result_cl),
-                            "filetype": suffix,
-                        },
-                    )
-
-                    # 展示结果 + 提供下载
-                    st.markdown("### ✅ 优化后的简历")
-                    st.text_area(
-                        "预览：优化简历（可复制粘贴）",
-                        value=result_cv,
-                        height=260,
-                    )
-
-                    cv_docx_bytes = export_docx(
-                        result_cv,
-                        "Optimized_CV.docx",
-                    )
-
-                    st.download_button(
-                        "⬇️ 下载优化后简历（DOCX）",
-                        data=cv_docx_bytes,
-                        file_name="optimized_cv.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    )
-
-                    if result_cl:
-                        st.markdown("### 📄 求职信（Cover Letter）")
-                        st.text_area(
-                            "预览：求职信（可复制粘贴）",
-                            value=result_cl,
-                            height=220,
-                        )
-                        cl_docx_bytes = export_docx(
-                            result_cl,
-                            "Cover_Letter.docx",
-                        )
-                        st.download_button(
-                            "⬇️ 下载求职信（DOCX）",
-                            data=cl_docx_bytes,
-                            file_name="cover_letter.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        )
-
-        except Exception as e:
-            log_error("generate_exception", e)
-            st.error("生成过程中出现错误，我已经收到错误日志，会尽快修复 🙏")
-
-# ========== 用户反馈区（写在页面最底部） ==========
+generate_btn = st.button("🚀 一键生成", use_container_width=True, type="primary")
 
 st.markdown("---")
+
+# 反馈入口
 with st.expander("💬 提交反馈 / 功能建议（可选）"):
-    with st.form("user_feedback_form"):
-        fb_text = st.text_area(
-            "写下你在使用过程中的任何想法：好用的地方 / 有问题的地方 / 希望增加的功能…",
-            height=120,
-        )
-        contact = st.text_input("联系方式（可选）例如邮箱 / 小红书 / 微信号（如不留可以匿名反馈）")
-        submitted = st.form_submit_button("提交反馈")
-    if submitted:
-        if fb_text.strip():
-            log_feedback(fb_text, contact)
-            st.success("感谢你的反馈，我已经收到，会据此继续优化产品 🙏")
-        else:
-            st.warning("请先写一点内容再提交～")
+    fb_col1, fb_col2 = st.columns([2, 1])
+    with fb_col1:
+        feedback_text = st.text_area("反馈内容（例如：哪里好用 / 哪里有 bug / 希望新增什么功能）", height=120)
+        contact = st.text_input("联系方式（可选，方便我回复你，例如邮箱/微信）")
+    with fb_col2:
+        if st.button("提交反馈"):
+            if feedback_text.strip():
+                log_feedback(
+                    {
+                        "sid": SESSION_ID,
+                        "ts": datetime.utcnow().isoformat(),
+                        "feedback": feedback_text.strip(),
+                        "contact": contact.strip(),
+                    }
+                )
+                st.success("感谢反馈！我会尽快查看并优化。")
+            else:
+                st.warning("请输入一些反馈内容再提交～")
 
-# footer
-st.caption(
-    "© 2025 AI Resume Optimizer | 仅供个人求职使用，禁止商用与爬虫爬取。"
-)
+
+# 页面底部版权
+st.caption("© 2025 AI Resume Optimizer | 仅供个人求职使用，禁止商用与爬取。")
+
+
+# ============ 主逻辑：点击 “一键生成” ============
+def handle_generate():
+    if not uploaded_file:
+        st.warning("请先上传一份 PDF 或 DOCX 简历。")
+        return
+
+    # 文件大小限制 50MB
+    if uploaded_file.size > 50 * 1024 * 1024:
+        st.error("文件过大，请控制在 50MB 以内。")
+        return
+
+    if not jd_text.strip():
+        st.warning("建议粘贴至少一个目标职位 JD 或 优化指令，这样效果会更好哦。")
+
+    # 读取文件
+    file_bytes = uploaded_file.read()
+    file_name = uploaded_file.name.lower()
+
+    try:
+        if file_name.endswith(".docx"):
+            cv_text = read_docx(file_bytes)
+        elif file_name.endswith(".pdf"):
+            if enable_ocr:
+                st.info("当前版本暂未集成 OCR 引擎，将先尝试直接识别 PDF 文本。")
+            cv_text = read_pdf(file_bytes)
+        else:
+            st.error("当前仅支持 PDF 和 DOCX 格式。")
+            return
+    except Exception as e:
+        log_error(
+            "file_parse_error",
+            {
+                "sid": SESSION_ID,
+                "file_name": uploaded_file.name,
+                "error": str(e),
+            },
+        )
+        st.error("读取简历文件时出错，请确认文件是否正常或稍后重试。")
+        return
+
+    if not cv_text.strip():
+        st.error("没有从简历中读取到有效文本，可能是扫描件或加密文件。")
+        return
+
+    with st.spinner("AI 正在为你优化简历，请稍候…"):
+        try:
+            result_text = call_openai(
+                cv_text=cv_text,
+                jd_text=jd_text,
+                focus_tags=focus_tags,
+                custom_points=custom_points,
+                need_cover_letter=need_cover_letter,
+            )
+        except Exception as e:
+            log_error(
+                "openai_error",
+                {
+                    "sid": SESSION_ID,
+                    "error": str(e),
+                },
+            )
+            st.error("调用 AI 接口时出错，请检查 API Key 或稍后重试。")
+            return
+
+    # 成功埋点
+    log_event(
+        "generate_success",
+        {
+            "sid": SESSION_ID,
+            "ts": datetime.utcnow().isoformat(),
+            "file_name": uploaded_file.name,
+            "file_size": uploaded_file.size,
+            "need_cover_letter": need_cover_letter,
+            "focus_tags": focus_tags,
+        },
+    )
+
+    st.markdown("### ✅ 生成结果（可直接复制或下载为 Word）")
+    st.markdown(result_text)
+
+    # 导出 Word
+    docx_bytes = make_docx(result_text)
+    safe_name = os.path.splitext(uploaded_file.name)[0]
+    export_filename = f"{safe_name}_AI优化版.docx"
+
+    st.download_button(
+        label="⬇️ 下载 Word 版本（DOCX）",
+        data=docx_bytes,
+        file_name=export_filename,
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+if generate_btn:
+    handle_generate()
