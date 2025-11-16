@@ -5,7 +5,7 @@
 - 读取的是分字段的 Secrets：
   GOOGLE_SHEETS_PROJECT_ID
   GOOGLE_SHEETS_PRIVATE_KEY_ID
-  GOOGLE_SHEETS_PRIVATE_KEY   （多行私钥，已经带真实换行）
+  GOOGLE_SHEETS_PRIVATE_KEY   （多行真换行）
   GOOGLE_SHEETS_CLIENT_EMAIL
   GOOGLE_SHEETS_CLIENT_ID
   GOOGLE_SHEETS_SHEET_ID
@@ -16,9 +16,9 @@ import json
 from datetime import datetime
 
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 
-# 关键：同时支持环境变量 和 st.secrets
+# 尝试导入 streamlit（在本地脚本运行时也不至于崩）
 try:
     import streamlit as st
 except Exception:
@@ -27,19 +27,22 @@ except Exception:
 
 def _get_secret(name: str) -> str | None:
     """
-    优先从环境变量取；如果取不到，再尝试 st.secrets.
-    这样无论你是用 Streamlit Secrets 还是 Docker/env，都能兼容。
+    优先从 Streamlit secrets 读取；
+    如果没有，再尝试从环境变量读取。
     """
-    value = os.getenv(name)
-    if value:
-        return value
+    # 先看环境变量（本地调试时可能用得到）
+    env_val = os.getenv(name)
+    if env_val:
+        return env_val
 
+    # 在线部署时，从 st.secrets 读取
     if st is not None:
         try:
-            # Streamlit Secrets 是个 dict-like
+            # st.secrets 是一个 dict-like 对象
             return st.secrets.get(name)
         except Exception:
             return None
+
     return None
 
 
@@ -70,12 +73,14 @@ worksheet = None
 
 if ANALYTICS_ENABLED:
     try:
-        # 注意：现在 PRIVATE_KEY 已经是多行真实私钥，不需要再 replace("\\n", "\n")
+        # ⚠️ 现在约定：PRIVATE_KEY 已经是多行真换行的内容，不再做 "\\n" -> "\n" 的替换
+        fixed_private_key = PRIVATE_KEY
+
         credentials_dict = {
             "type": "service_account",
             "project_id": PROJECT_ID,
             "private_key_id": PRIVATE_KEY_ID,
-            "private_key": PRIVATE_KEY,  # 直接用
+            "private_key": fixed_private_key,
             "client_email": CLIENT_EMAIL,
             "client_id": CLIENT_ID,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
@@ -89,13 +94,12 @@ if ANALYTICS_ENABLED:
         }
 
         scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
+            "https://spreadsheets.google.com/feeds",
             "https://www.googleapis.com/auth/drive",
         ]
 
-        creds = Credentials.from_service_account_info(
-            credentials_dict,
-            scopes=scopes,
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            credentials_dict, scopes=scopes
         )
         gc = gspread.authorize(creds)
 
