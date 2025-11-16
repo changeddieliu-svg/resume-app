@@ -9,7 +9,7 @@ import pdfplumber
 from docx import Document
 
 # =========================================================
-# 1. 基础配置 & 安全地加载 analytics（可选）
+# 1. 页面基础配置
 # =========================================================
 
 st.set_page_config(
@@ -30,38 +30,46 @@ HIDE_STREAMLIT_STYLE = """
 """
 st.markdown(HIDE_STREAMLIT_STYLE, unsafe_allow_html=True)
 
-# ---- OpenAI 客户端 ----
+# =========================================================
+# 2. OpenAI 客户端
+# =========================================================
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
 if not OPENAI_API_KEY:
     st.error("未配置 OPENAI_API_KEY，请在 Streamlit → Settings → Secrets 中添加。")
+
 client = OpenAI()
 
 
-# ---- 安全加载 analytics（Google Sheet） ----
-try:
-    import analytics  # 你自己的 analytics.py
+# =========================================================
+# 3. 安全加载 analytics（Google Sheet 埋点）
+# =========================================================
 
-    ANALYTICS_AVAILABLE = True
+try:
+    import analytics  # 本地的 analytics.py
+    ANALYTICS_AVAILABLE = getattr(analytics, "ANALYTICS_ENABLED", False)
 except Exception:
     analytics = None
     ANALYTICS_AVAILABLE = False
 
 
 def safe_log_event(event_type: str, data: dict):
-    """所有埋点都通过这里调用，避免影响主流程"""
-    if not ANALYTICS_AVAILABLE:
+    """
+    所有埋点都通过这里调用，避免影响主流程。
+    """
+    if not ANALYTICS_AVAILABLE or analytics is None:
         return
     try:
         analytics.log_event(event_type, data)
-    except Exception:
-        # 不在 UI 中打扰用户，只是静默失败
-        pass
+    except Exception as e:
+        # 只在服务器日志里打出来，不打扰用户
+        print(f"[safe_log_event] 记录 {event_type} 失败: {e}")
 
 
 # =========================================================
-# 2. 工具函数：读取简历 & 生成 DOCX
+# 4. 工具函数：读取简历 & 生成 DOCX
 # =========================================================
 
 def read_docx(file_bytes: bytes) -> str:
@@ -89,11 +97,14 @@ def read_pdf(file_bytes: bytes) -> str:
 
 
 def extract_resume_text(uploaded_file, enable_ocr: bool) -> str:
-    """根据文件类型提取文本；OCR 目前只给提示，不做真正识别"""
+    """
+    根据文件类型提取文本；
+    目前 OCR 只给提示，不做真正识别。
+    """
     suffix = (uploaded_file.name or "").lower()
 
     file_bytes = uploaded_file.read()
-    # 读完要复位，不然后面再读会是空
+    # 读完要复位，否则后面再读会是空
     uploaded_file.seek(0)
 
     if suffix.endswith(".docx"):
@@ -120,7 +131,7 @@ def create_docx(content: str) -> bytes:
 
 
 # =========================================================
-# 3. Prompt 构建 & 调 OpenAI
+# 5. Prompt 构建 & 调 OpenAI
 # =========================================================
 
 def detect_language(text: str) -> str:
@@ -204,7 +215,9 @@ def call_openai(prompt: str) -> str:
 
 
 def parse_model_output(raw: str):
-    """根据约定的分隔符切分出简历 & 求职信"""
+    """
+    根据约定的分隔符切分出简历 & 求职信
+    """
     resume = ""
     cover = ""
 
@@ -230,13 +243,12 @@ def parse_model_output(raw: str):
 
 
 # =========================================================
-# 4. 页面 UI
+# 6. 页面 UI
 # =========================================================
 
 # ---- 左侧设置栏 ----
 with st.sidebar:
     st.title("设置")
-
     st.caption("（左侧选项仅影响生成的强调方向）")
 
     focus_options = [
@@ -265,6 +277,10 @@ with st.sidebar:
     st.markdown("---")
     st.caption("仅供个人求职使用，禁止商用与爬取。")
 
+    # 显示当前 analytics 状态，方便你排查
+    status = "开启 ✅" if ANALYTICS_AVAILABLE else "已关闭 ⚠️"
+    st.caption(f"Analytics 状态：{status}")
+
 # ---- 页面标题 ----
 st.markdown("## 🧠 AI 智能简历优化")
 
@@ -273,7 +289,9 @@ col_left, col_right = st.columns(2, gap="large")
 with col_left:
     st.subheader("上传简历（PDF 或 DOCX）")
     uploaded_file = st.file_uploader(
-        "", type=["pdf", "docx"], label_visibility="collapsed"
+        "",
+        type=["pdf", "docx"],
+        label_visibility="collapsed",
     )
     st.caption("支持 PDF / DOCX，单文件 ≤ 50MB；扫描件可启用 OCR。")
 
@@ -302,7 +320,7 @@ safe_log_event(
 )
 
 # =========================================================
-# 5. 主按钮：一键生成
+# 7. 主按钮：一键生成
 # =========================================================
 
 generate_btn = st.button("🚀 一键生成", use_container_width=True)
@@ -375,7 +393,7 @@ if generate_btn:
     )
 
 # =========================================================
-# 6. 用户反馈入口
+# 8. 用户反馈入口
 # =========================================================
 
 st.markdown("---")
