@@ -1,187 +1,184 @@
+# analytics.py
+"""
+简单的 Google Sheets 埋点模块：
+- 事件日志：events
+- 用户反馈：feedback
+- 错误：errors
+- Token / 配额监控：quota（预留）
+
+依赖：
+- gspread
+- oauth2client
+"""
+
+from __future__ import annotations
+
 import json
-from datetime import datetime
+import datetime as dt
 from typing import Any, Dict, Optional
 
 import streamlit as st
 
-# 依赖：gspread, google-auth
-# 确保 requirements.txt 里包含：
-# gspread
-# google-auth
-
-import gspread
-from google.oauth2.service_account import Credentials
-
-# 只需要访问当前这张表
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly",
-          "https://www.googleapis.com/auth/spreadsheets"]
+# 如果这些包没装，会在 UI 明确提示
+try:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+except Exception as e:  # noqa: BLE001
+    gspread = None
+    ServiceAccountCredentials = None
+    st.sidebar.warning(f"⚠️ Analytics 库未安装完整：{e}. 请确认 requirements.txt 已包含 gspread 和 oauth2client。")
 
 
-# ---------- 基础工具 ----------
+# ---------- 内部工具 ----------
 
-@st.cache_resource(show_spinner=False)
-def _get_gspread_client() -> gspread.Client:
-    """
-    用 service account JSON + scopes 创建 gspread client。
-    JSON 来自 st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]。
-    """
-    raw = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if raw is None:
-        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON in st.secrets")
-
-    if isinstance(raw, str):
-        info = json.loads(raw)
-    else:
-        # 如果在本地开发时用 TOML 的 [[GOOGLE_SERVICE_ACCOUNT_JSON]] 结构，也兼容
-        info = dict(raw)
-
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    return gspread.authorize(creds)
+def _get_session_id() -> str:
+    """给每个浏览器会话一个稳定 id，方便区分用户行为。"""
+    if "sid" not in st.session_state:
+        st.session_state["sid"] = dt.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    return st.session_state["sid"]
 
 
 @st.cache_resource(show_spinner=False)
-def _get_spreadsheet() -> gspread.Spreadsheet:
-    client = _get_gspread_client()
-    sheet_id = st.secrets.get("GOOGLE_SHEET_ID")
-    if not sheet_id:
-        raise RuntimeError("Missing GOOGLE_SHEET_ID in st.secrets")
-    return client.open_by_key(sheet_id)
+def _get_sheet_client():
+    """初始化 Google Sheets 客户端和各个 worksheet。
 
+    如果任何一步失败，会在侧边栏提示，并返回 (None, None, None, None)。
+    """
+    if gspread is None or ServiceAccountCredentials is None:
+        return None, None, None, None
 
-def _ensure_worksheet(
-    spreadsheet: gspread.Spreadsheet,
-    title: str,
-    header: list[str],
-) -> gspread.Worksheet:
-    """
-    如果工作表不存在则创建，并在首行写入 header。
-    已存在则直接返回。
-    """
     try:
-        ws = spreadsheet.worksheet(title)
-    except gspread.WorksheetNotFound:
-        # 创建新的 worksheet
-        ws = spreadsheet.add_worksheet(title=title, rows="1000", cols=str(len(header) + 5))
-        ws.append_row(header)
-    else:
-        # 如果第一行是空的，也补上表头（防止手滑清空）
+        # 1) 从 secrets 读取 service account JSON
+        raw_json = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if not raw_json:
+            st.sidebar.warning("⚠️ 未配置 GOOGLE_SERVICE_ACCOUNT_JSON，Analytics 已关闭。")
+            return None, None, None, None
+
+        # raw_json 是字符串，需要转成 dict
         try:
-            first_row = ws.row_values(1)
-        except Exception:
-            first_row = []
-        if not any(first_row):
-            ws.append_row(header)
-    return ws
+            svc_info = json.loads(raw_json)
+        except json.JSONDecodeError as e:  # noqa: F841
+            st.sidebar.warning("⚠️ GOOGLE_SERVICE_ACCOUNT_JSON 解析失败，请检查是否完整复制。")
+            return None, None, None, None
+
+        # 2) 创建凭证 & client
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(svc_info, scope)
+        client = gspread.authorize(creds)
+
+        # 3) 打开指定的 Sheet
+        sheet_id = st.secrets.get("GOOGLE_SHEET_ID")
+        if not sheet_id:
+            st.sidebar.warning("⚠️ 未配置 GOOGLE_SHEET_ID，Analytics 已关闭。")
+            return None, None, None, None
+
+        sh = client.open_by_key(sheet_id)
+
+        # 4) 准备各个 worksheet（没有就创建）
+        def get_or_create_ws(title: str, headers: list[str]):
+            try:
+                ws = sh.worksheet(title)
+            except gspread.WorksheetNotFound:
+                ws = sh.add_worksheet(title=title, rows=2000, cols=len(headers) + 2)
+                ws.append_row(headers, value_input_option="USER_ENTERED")
+                return ws
+
+            # 如果第一行不是我们想要的表头，就补上（不会删除你已有的数据）
+            try:
+                first_row = ws.row_values(1)
+            except Exception:
+                first_row = []
+
+            if not first_row:
+                ws.append_row(headers, value_input_option="USER_ENTERED")
+            return ws
+
+        events_ws = get_or_create_ws(
+            "events",
+            ["timestamp_utc", "session_id", "event_type", "user_email", "extra_json"],
+        )
+        feedback_ws = get_or_create_ws(
+            "feedback",
+            ["timestamp_utc", "session_id", "rating", "comment", "contact"],
+        )
+        errors_ws = get_or_create_ws(
+            "errors",
+            ["timestamp_utc", "session_id", "error_message", "context_json"],
+        )
+        quota_ws = get_or_create_ws(
+            "quota",
+            ["timestamp_utc", "session_id", "event_type", "input_tokens", "output_tokens"],
+        )
+
+        return events_ws, feedback_ws, errors_ws, quota_ws
+
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.warning(f"⚠️ 初始化 Google Sheets 失败：{e}")
+        return None, None, None, None
 
 
-def _base_fields() -> list[Any]:
-    """所有日志记录共用的一些字段。"""
-    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+# ---------- 对外函数 ----------
 
-    sid = st.session_state.get("sid") or st.session_state.get("_session_id") or ""
-    user = st.session_state.get("user_email") or st.session_state.get("username") or "anonymous"
+def log_event(event_type: str, user_email: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> None:
+    """记录一般事件，例如 page_view / generation / download 等。"""
+    events_ws, _, _, _ = _get_sheet_client()
+    if events_ws is None:
+        return
 
-    return [now, sid, user]
-
-
-def _safe_json(data: Optional[Dict[str, Any]]) -> str:
-    if not data:
-        return ""
     try:
-        return json.dumps(data, ensure_ascii=False)
+        ts = dt.datetime.utcnow().isoformat()
+        sid = _get_session_id()
+        payload = json.dumps(extra or {}, ensure_ascii=False)
+        events_ws.append_row([ts, sid, event_type, user_email or "", payload], value_input_option="USER_ENTERED")
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.warning(f"⚠️ 写入事件日志失败：{e}")
+
+
+def log_feedback(rating: int, comment: str = "", contact: str = "") -> None:
+    """记录用户反馈（你可以在产品里加一个简单的反馈框再调用）。"""
+    _, feedback_ws, _, _ = _get_sheet_client()
+    if feedback_ws is None:
+        return
+
+    try:
+        ts = dt.datetime.utcnow().isoformat()
+        sid = _get_session_id()
+        feedback_ws.append_row([ts, sid, rating, comment, contact], value_input_option="USER_ENTERED")
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.warning(f"⚠️ 写入反馈失败：{e}")
+
+
+def log_error(error_message: str, context: Optional[Dict[str, Any]] = None) -> None:
+    """记录错误信息，方便排查用户问题。"""
+    _, _, errors_ws, _ = _get_sheet_client()
+    if errors_ws is None:
+        return
+
+    try:
+        ts = dt.datetime.utcnow().isoformat()
+        sid = _get_session_id()
+        context_json = json.dumps(context or {}, ensure_ascii=False)
+        errors_ws.append_row([ts, sid, error_message, context_json], value_input_option="USER_ENTERED")
     except Exception:
-        return str(data)
+        # 这里就不再重复提示了，避免报错时疯狂刷 warning
+        pass
 
 
-# ---------- 对外暴露的记录函数 ----------
+def log_quota(event_type: str, input_tokens: int = 0, output_tokens: int = 0) -> None:
+    """可选：记录一次请求大概用了多少 token，帮助你监控开销。"""
+    _, _, _, quota_ws = _get_sheet_client()
+    if quota_ws is None:
+        return
 
-def log_usage(event: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    """
-    记录正常使用行为：
-    - 页面浏览
-    - 点击一键生成
-    - 导出文件 等等
-    """
     try:
-        ss = _get_spreadsheet()
-        ws = _ensure_worksheet(
-            ss,
-            "Usage_Log",
-            ["timestamp_utc", "session_id", "user", "event", "extra_json"],
+        ts = dt.datetime.utcnow().isoformat()
+        sid = _get_session_id()
+        quota_ws.append_row(
+            [ts, sid, event_type, int(input_tokens or 0), int(output_tokens or 0)],
+            value_input_option="USER_ENTERED",
         )
-        row = _base_fields() + [event, _safe_json(extra)]
-        ws.append_row(row)
-    except Exception as e:
-        # 不要因为埋点出错导致主功能崩溃
-        print("[analytics] log_usage error:", e)
-
-
-def log_error(location: str, error_message: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    """
-    记录错误信息，方便你在 Sheet 里监控。
-    location: 出错的大概位置，例如 "generate_documents" / "ocr_extract" 等
-    """
-    try:
-        ss = _get_spreadsheet()
-        ws = _ensure_worksheet(
-            ss,
-            "Error_Log",
-            ["timestamp_utc", "session_id", "user", "location", "error_message", "extra_json"],
-        )
-        row = _base_fields() + [location, error_message, _safe_json(extra)]
-        ws.append_row(row)
-    except Exception as e:
-        print("[analytics] log_error error:", e)
-
-
-def log_feedback(
-    feedback_text: str,
-    rating: Optional[int] = None,
-    contact: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    记录用户反馈：
-    - feedback_text: 用户输入的评价/建议
-    - rating: 可选评分（1-5）
-    - contact: 可选联系方式（微信/邮箱等）
-    """
-    try:
-        ss = _get_spreadsheet()
-        ws = _ensure_worksheet(
-            ss,
-            "User_Feedback",
-            [
-                "timestamp_utc",
-                "session_id",
-                "user",
-                "rating",
-                "feedback_text",
-                "contact",
-                "extra_json",
-            ],
-        )
-        row = _base_fields() + [rating if rating is not None else "", feedback_text, contact or "", _safe_json(extra)]
-        ws.append_row(row)
-    except Exception as e:
-        print("[analytics] log_feedback error:", e)
-
-
-def log_system_event(event: str, extra: Optional[Dict[str, Any]] = None) -> None:
-    """
-    记录系统级事件，例如：
-    - "app_started"
-    - "api_key_missing_fallback_demo"
-    等。
-    """
-    try:
-        ss = _get_spreadsheet()
-        ws = _ensure_worksheet(
-            ss,
-            "System_Events",
-            ["timestamp_utc", "session_id", "user", "event", "extra_json"],
-        )
-        row = _base_fields() + [event, _safe_json(extra)]
-        ws.append_row(row)
-    except Exception as e:
-        print("[analytics] log_system_event error:", e)
+    except Exception:
+        pass
