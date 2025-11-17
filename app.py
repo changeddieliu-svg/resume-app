@@ -60,7 +60,7 @@ def safe_log_event(event_type: str, data: dict):
 
 
 # =========================================================
-# 2. 工具函数：读取简历 & 生成 DOCX
+# 2. 工具函数：读取简历 & 生成 DOCX（带 bullet 样式）
 # =========================================================
 
 def read_docx(file_bytes: bytes) -> str:
@@ -107,11 +107,70 @@ def extract_resume_text(uploaded_file, enable_ocr: bool) -> str:
         return ""
 
 
-def create_docx(content: str) -> bytes:
-    """将纯文本写入 DOCX，并以 bytes 形式返回用于下载"""
+def create_docx_with_lists(content: str) -> bytes:
+    """
+    将模型输出的纯文本写入 DOCX：
+    - 识别以 - / * / • 开头的行为无序列表（bullet）
+    - 识别简单的 1. / 2) 这种为有序列表
+    - 其它按普通段落处理
+    """
+    from docx.enum.style import WD_STYLE_TYPE  # 以防有些模板没有 List Bullet / List Number
+
     doc = Document()
-    for line in content.splitlines():
-        doc.add_paragraph(line)
+
+    # 确保有列表样式（大多数模板自带，这里只是兜底不报错）
+    styles = doc.styles
+    has_bullet = any(
+        s.type == WD_STYLE_TYPE.PARAGRAPH and s.name == "List Bullet" for s in styles
+    )
+    has_number = any(
+        s.type == WD_STYLE_TYPE.PARAGRAPH and s.name == "List Number" for s in styles
+    )
+
+    lines = content.splitlines()
+
+    for line in lines:
+        raw = line.rstrip("\n")
+        stripped = raw.strip()
+
+        # 空行 -> 空段落，做分段
+        if not stripped:
+            doc.add_paragraph("")
+            continue
+
+        # 简单检测 bullet
+        bullet_prefixes = ("- ", "* ", "• ", "· ")
+        is_bullet = any(stripped.startswith(p) for p in bullet_prefixes)
+
+        # 简单检测有序列表：1. xxx / 2) xxx
+        is_numbered = False
+        if stripped[0].isdigit():
+            if len(stripped) > 2 and stripped[1:3] in (". ", ") "):
+                is_numbered = True
+
+        if is_bullet and has_bullet:
+            # 去掉前缀里的符号
+            for p in bullet_prefixes:
+                if stripped.startswith(p):
+                    text = stripped[len(p):].strip()
+                    break
+            else:
+                text = stripped
+            p = doc.add_paragraph(text)
+            p.style = "List Bullet"
+        elif is_numbered and has_number:
+            # 截掉前面的 "1. " / "2) "
+            first_space = stripped.find(" ")
+            if first_space != -1:
+                text = stripped[first_space + 1:].strip()
+            else:
+                text = stripped
+            p = doc.add_paragraph(text)
+            p.style = "List Number"
+        else:
+            # 普通段落
+            doc.add_paragraph(stripped)
+
     buffer = io.BytesIO()
     doc.save(buffer)
     buffer.seek(0)
@@ -264,6 +323,12 @@ with st.sidebar:
     st.markdown("---")
     st.caption("仅供个人求职使用，禁止商用与爬取。")
 
+    # 显示 Analytics 状态，方便你确认是否写入 Google Sheet
+    if ANALYTICS_AVAILABLE:
+        st.caption("📊 Analytics：**已启用**（数据写入 Google Sheet）")
+    else:
+        st.caption("📊 Analytics：**未启用**（当前不记录使用数据）")
+
 # ---- 页面标题 ----
 st.markdown("## 🧠 AI 智能简历优化")
 
@@ -281,9 +346,9 @@ with col_right:
     jd_text = st.text_area(
         "",
         placeholder=(
-            "例如：Actuarial graduate role at Deloitte。"
-            "可以直接写 JD，也可以写优化指令，例如："
-            "‘请重点突出数据分析与建模能力；Cover Letter 要更正式’。"
+            "例如：Actuarial graduate role at Deloitte。\n"
+            "可以直接贴 JD，也可以写优化指令，例如：\n"
+            "“请重点突出数据分析与建模能力；Cover Letter 要更正式”。"
         ),
         height=180,
         label_visibility="collapsed",
@@ -291,7 +356,7 @@ with col_right:
 
 st.info("💡 提示：可在左侧设置“精修侧重/增强点”；若 PDF 为扫描件，可开启 OCR。")
 
-# ---- 页面打开埋点 ----
+# ---- 首次打开页面的埋点 ----
 safe_log_event(
     "page_view",
     {
@@ -301,13 +366,12 @@ safe_log_event(
 )
 
 # =========================================================
-# 5. 主按钮：一键生成（用 session_state 保留结果）
+# 5. 主按钮：一键生成
 # =========================================================
 
 generate_btn = st.button("🚀 一键生成", use_container_width=True)
 
 if generate_btn:
-    # 每次点“一键生成”时，重新生成并覆盖 session_state 中的结果
     if not uploaded_file:
         st.error("请先上传简历文件（PDF 或 DOCX）。")
         st.stop()
@@ -337,18 +401,31 @@ if generate_btn:
         raw_output = call_openai(prompt)
         optimized_resume, cover_letter_text = parse_model_output(raw_output)
 
-    # 把结果存入 session_state，这样下载按钮触发刷新后也能继续显示
-    st.session_state["optimized_resume"] = optimized_resume
-    st.session_state["cover_letter_text"] = cover_letter_text
-    st.session_state["result_lang"] = lang
-    st.session_state["result_need_cover_letter"] = need_cover_letter
-    st.session_state["result_has_jd"] = bool(jd_text.strip())
-    st.session_state["result_file_meta"] = {
-        "filename": uploaded_file.name,
-        "filesize": uploaded_file.size,
-    }
+    # ===== 下载区 =====
+    st.success("生成完成，你可以下载优化后的简历（以及可选的求职信）。")
 
-    # 记录生成事件（只在真正生成时记录一次）
+    resume_docx_bytes = create_docx_with_lists(optimized_resume)
+    resume_filename = "Optimized_Resume.docx"
+    st.download_button(
+        "⬇️ 下载优化简历（DOCX）",
+        data=resume_docx_bytes,
+        file_name=resume_filename,
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    if need_cover_letter and cover_letter_text.strip():
+        cover_docx_bytes = create_docx_with_lists(cover_letter_text)
+        cover_filename = "Cover_Letter.docx"
+        st.download_button(
+            "⬇️ 下载求职信（DOCX）",
+            data=cover_docx_bytes,
+            file_name=cover_filename,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    elif need_cover_letter:
+        st.warning("本次模型输出中未识别到有效求职信内容，请检查提示词或重新生成。")
+
+    # 记录生成事件
     safe_log_event(
         "generate",
         {
@@ -362,43 +439,7 @@ if generate_btn:
     )
 
 # =========================================================
-# 6. 结果展示 & 下载区（基于 session_state）
-# =========================================================
-
-if "optimized_resume" in st.session_state:
-    optimized_resume = st.session_state["optimized_resume"]
-    cover_letter_text = st.session_state.get("cover_letter_text", "")
-    need_cover_letter_state = st.session_state.get(
-        "result_need_cover_letter", False
-    )
-
-    st.success("生成完成，你可以下载优化后的简历（以及可选的求职信）。")
-
-    resume_docx_bytes = create_docx(optimized_resume)
-    resume_filename = "Optimized_Resume.docx"
-    st.download_button(
-        "⬇️ 下载优化简历（DOCX）",
-        data=resume_docx_bytes,
-        file_name=resume_filename,
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        key="download_resume_btn",
-    )
-
-    if need_cover_letter_state and cover_letter_text.strip():
-        cover_docx_bytes = create_docx(cover_letter_text)
-        cover_filename = "Cover_Letter.docx"
-        st.download_button(
-            "⬇️ 下载求职信（DOCX）",
-            data=cover_docx_bytes,
-            file_name=cover_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            key="download_cover_btn",
-        )
-    elif need_cover_letter_state:
-        st.warning("本次模型输出中未识别到有效求职信内容，请检查提示词或重新生成。")
-
-# =========================================================
-# 7. 用户反馈入口
+# 6. 用户反馈入口
 # =========================================================
 
 st.markdown("---")
