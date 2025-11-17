@@ -175,15 +175,57 @@ def _add_markdown_line(doc: Document, line: str):
 
 def create_docx(content: str) -> bytes:
     """
-    把模型返回的纯文本，按行解析成带 Heading / bullet / 粗体 的 DOCX。
+    将模型输出的纯文本转换成 docx：
+    - 识别以 **xxx** / ## xxx / ### xxx 形式的标题：去掉标记，只加粗，使用 Normal 样式（黑色）
+    - 识别以 - / * / • 开头的行为 bullet 列表
+    - 其他行按普通段落写入
     """
     doc = Document()
-    lines = content.splitlines()
-    if not lines:
-        doc.add_paragraph("")  # 空文档兜底
-    else:
-        for line in lines:
-            _add_markdown_line(doc, line)
+
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+
+        # 空行：直接插入一个空段落，用来控制段落间距
+        if not line.strip():
+            doc.add_paragraph("")
+            continue
+
+        stripped = line.strip()
+
+        # ---------- 1) 标题：**Title** / ## Title / ### Title ----------
+        # 形式一：**Title**
+        if stripped.startswith("**") and stripped.endswith("**") and len(stripped) > 4:
+            title_text = stripped.strip("* ").strip()
+            p = doc.add_paragraph()          # 使用 Normal 样式
+            run = p.add_run(title_text)
+            run.bold = True
+            continue
+
+        # 形式二：## Title / ### Title
+        if stripped.startswith("#"):
+            title_text = stripped.lstrip("#").strip()
+            p = doc.add_paragraph()
+            run = p.add_run(title_text)
+            run.bold = True
+            continue
+
+        # ---------- 2) bullet 列表：- xxx / * xxx / • xxx ----------
+        # 去掉左侧空格再判断
+        lstripped = line.lstrip()
+
+        bullet_prefixes = ("- ", "* ", "• ")
+        if lstripped.startswith(bullet_prefixes):
+            bullet_text = lstripped[2:].strip()  # 去掉符号和空格
+            p = doc.add_paragraph(style="List Bullet")
+            run = p.add_run(bullet_text)
+            # bullet 一般不用再加粗，让内容显得更清晰
+            run.bold = False
+            continue
+
+        # ---------- 3) 普通段落 ----------
+        p = doc.add_paragraph()
+        run = p.add_run(line)
+        # 不额外设置样式 / 颜色，走 Normal 默认黑色
 
     buffer = io.BytesIO()
     doc.save(buffer)
