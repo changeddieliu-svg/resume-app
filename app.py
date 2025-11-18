@@ -1,7 +1,7 @@
 import io
 import os
-import re
 from datetime import datetime
+import re
 
 import streamlit as st
 from openai import OpenAI
@@ -40,22 +40,18 @@ if not OPENAI_API_KEY:
 client = OpenAI()
 
 # ---- 安全加载 analytics（Google Sheet） ----
-ANALYTICS_AVAILABLE = False
-ANALYTICS_ENABLED = False
 try:
     import analytics  # 你自己的 analytics.py
 
     ANALYTICS_AVAILABLE = True
-    ANALYTICS_ENABLED = bool(getattr(analytics, "ANALYTICS_ENABLED", False))
 except Exception:
     analytics = None
     ANALYTICS_AVAILABLE = False
-    ANALYTICS_ENABLED = False
 
 
 def safe_log_event(event_type: str, data: dict):
     """所有埋点都通过这里调用，避免影响主流程"""
-    if not ANALYTICS_AVAILABLE or not ANALYTICS_ENABLED:
+    if not ANALYTICS_AVAILABLE:
         return
     try:
         analytics.log_event(event_type, data)
@@ -65,7 +61,7 @@ def safe_log_event(event_type: str, data: dict):
 
 
 # =========================================================
-# 2. 工具函数：读取简历 & 生成 DOCX（支持简单 markdown）
+# 2. 工具函数：读取简历 & 生成 DOCX（带样式）
 # =========================================================
 
 def read_docx(file_bytes: bytes) -> str:
@@ -112,120 +108,81 @@ def extract_resume_text(uploaded_file, enable_ocr: bool) -> str:
         return ""
 
 
-def _add_runs_with_bold(paragraph, text: str):
+# ---- Markdown → DOCX 的核心工具 ----
+
+BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*")
+
+
+def add_markdown_paragraph(doc: Document, text: str, style: str | None = None):
     """
-    支持 **粗体** 的简单解析，把 ** 包裹的内容转成真正的粗体 run。
-    其他部分保持普通文本。
+    在 doc 中新增一段，并解析 **粗体**。
+    style 可为 None / "Heading 1" / "Heading 2" / "Heading 3" / "List Bullet"
     """
-    pattern = re.compile(r"(\*\*.*?\*\*)")
-    parts = re.split(pattern, text)
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith("**") and part.endswith("**") and len(part) > 4:
-            run_text = part[2:-2]
-            if run_text:
-                run = paragraph.add_run(run_text)
-                run.bold = True
-        else:
-            paragraph.add_run(part)
+    if style:
+        para = doc.add_paragraph(style=style)
+    else:
+        para = doc.add_paragraph()
+
+    pos = 0
+    for m in BOLD_PATTERN.finditer(text):
+        # 普通文本片段
+        if m.start() > pos:
+            para.add_run(text[pos:m.start()])
+        # 粗体片段（去掉 **）
+        bold_text = m.group(1)
+        run = para.add_run(bold_text)
+        run.bold = True
+        pos = m.end()
+
+    # 最后剩余部分
+    if pos < len(text):
+        para.add_run(text[pos:])
+
+    return para
 
 
-def _add_markdown_line(doc: Document, line: str):
+def create_docx_from_markdown(content: str) -> bytes:
     """
-    把一行“伪 Markdown”文本加到 doc 里：
-    - # / ## / ### 开头 => Heading 1/2/3
-    - -, *, • 开头 => bullet 列表
-    - 其余 => 普通段落，支持 **粗体** 解析
-    """
-    raw = line.rstrip("\r\n")
-    stripped = raw.strip()
-
-    # 空行 => 空段落（拉一点间距）
-    if not stripped:
-        doc.add_paragraph("")
-        return
-
-    # 标题级别
-    if stripped.startswith("### "):
-        text = stripped[4:].strip()
-        p = doc.add_paragraph(text or "", style="Heading 3")
-        return
-    elif stripped.startswith("## "):
-        text = stripped[3:].strip()
-        p = doc.add_paragraph(text or "", style="Heading 2")
-        return
-    elif stripped.startswith("# "):
-        text = stripped[2:].strip()
-        p = doc.add_paragraph(text or "", style="Heading 1")
-        return
-
-    # bullet 列表
-    m = re.match(r"^[-*•]\s+(.*)", stripped)
-    if m:
-        content = m.group(1).strip()
-        p = doc.add_paragraph(style="List Bullet")
-        _add_runs_with_bold(p, content)
-        return
-
-    # 普通段落
-    p = doc.add_paragraph()
-    _add_runs_with_bold(p, stripped)
-
-
-def create_docx(content: str) -> bytes:
-    """
-    将模型输出的纯文本转换成 docx：
-    - 识别以 **xxx** / ## xxx / ### xxx 形式的标题：去掉标记，只加粗，使用 Normal 样式（黑色）
-    - 识别以 - / * / • 开头的行为 bullet 列表
-    - 其他行按普通段落写入
+    把模型输出的「类 Markdown 文本」转成 Word 文档：
+    - # / ## / ### → Heading 1/2/3
+    - - / * / • 开头 → List Bullet
+    - **粗体** → 粗体 Run
     """
     doc = Document()
+    lines = content.splitlines()
 
-    for raw_line in content.splitlines():
-        line = raw_line.rstrip()
+    for line in lines:
+        raw = line.rstrip("\n")
+        stripped = raw.strip()
 
-        # 空行：直接插入一个空段落，用来控制段落间距
-        if not line.strip():
+        # 空行：直接加空段落
+        if not stripped:
             doc.add_paragraph("")
             continue
 
-        stripped = line.strip()
-
-        # ---------- 1) 标题：**Title** / ## Title / ### Title ----------
-        # 形式一：**Title**
-        if stripped.startswith("**") and stripped.endswith("**") and len(stripped) > 4:
-            title_text = stripped.strip("* ").strip()
-            p = doc.add_paragraph()          # 使用 Normal 样式
-            run = p.add_run(title_text)
-            run.bold = True
+        # 标题（heading）
+        if stripped.startswith("### "):
+            text = stripped[4:].strip()
+            add_markdown_paragraph(doc, text, style="Heading 3")
+            continue
+        elif stripped.startswith("## "):
+            text = stripped[3:].strip()
+            add_markdown_paragraph(doc, text, style="Heading 2")
+            continue
+        elif stripped.startswith("# "):
+            text = stripped[2:].strip()
+            add_markdown_paragraph(doc, text, style="Heading 1")
             continue
 
-        # 形式二：## Title / ### Title
-        if stripped.startswith("#"):
-            title_text = stripped.lstrip("#").strip()
-            p = doc.add_paragraph()
-            run = p.add_run(title_text)
-            run.bold = True
-            continue
-
-        # ---------- 2) bullet 列表：- xxx / * xxx / • xxx ----------
-        # 去掉左侧空格再判断
-        lstripped = line.lstrip()
-
+        # 项目符号（支持 -, *, • 三种前缀）
         bullet_prefixes = ("- ", "* ", "• ")
-        if lstripped.startswith(bullet_prefixes):
-            bullet_text = lstripped[2:].strip()  # 去掉符号和空格
-            p = doc.add_paragraph(style="List Bullet")
-            run = p.add_run(bullet_text)
-            # bullet 一般不用再加粗，让内容显得更清晰
-            run.bold = False
+        if any(stripped.startswith(p) for p in bullet_prefixes):
+            text = stripped[2:].strip()
+            add_markdown_paragraph(doc, text, style="List Bullet")
             continue
 
-        # ---------- 3) 普通段落 ----------
-        p = doc.add_paragraph()
-        run = p.add_run(line)
-        # 不额外设置样式 / 颜色，走 Normal 默认黑色
+        # 其它普通段落
+        add_markdown_paragraph(doc, stripped)
 
     buffer = io.BytesIO()
     doc.save(buffer)
@@ -344,16 +301,22 @@ def parse_model_output(raw: str):
 
 
 # =========================================================
-# 4. 页面 UI
+# 4. Session State：保存结果，避免下载时丢失
 # =========================================================
 
-# 初始化 session_state，保证结果不会因为重新运行而丢失
 if "optimized_resume" not in st.session_state:
     st.session_state["optimized_resume"] = ""
-if "cover_letter" not in st.session_state:
-    st.session_state["cover_letter"] = ""
+if "cover_letter_text" not in st.session_state:
+    st.session_state["cover_letter_text"] = ""
 if "result_lang" not in st.session_state:
-    st.session_state["result_lang"] = "en"
+    st.session_state["result_lang"] = None
+if "last_meta" not in st.session_state:
+    st.session_state["last_meta"] = {}
+
+
+# =========================================================
+# 5. 页面 UI
+# =========================================================
 
 # ---- 左侧设置栏 ----
 with st.sidebar:
@@ -385,12 +348,18 @@ with st.sidebar:
     enable_ocr = st.checkbox("🔍 启用 OCR（扫描 PDF）", value=False)
 
     st.markdown("---")
-    st.caption("仅供个人求职使用，禁止商用与爬取。")
 
-    # Analytics 状态指示
-    status_icon = "✅" if ANALYTICS_ENABLED else "⚪"
-    status_label = "已开启" if ANALYTICS_ENABLED else "已关闭"
-    st.caption(f"Analytics 状态：{status_icon} {status_label}")
+    # Analytics 状态显示
+    analytics_enabled = (
+        ANALYTICS_AVAILABLE
+        and getattr(analytics, "ANALYTICS_ENABLED", False)
+    )
+    if analytics_enabled:
+        st.caption("Analytics 状态：✅ 已开启（写入 Google Sheet）")
+    else:
+        st.caption("Analytics 状态：⚠️ 已关闭或配置不完整")
+
+    st.caption("仅供个人求职使用，禁止商用与爬取。")
 
 # ---- 页面标题 ----
 st.markdown("## 🧠 AI 智能简历优化")
@@ -429,7 +398,7 @@ safe_log_event(
 )
 
 # =========================================================
-# 5. 主按钮：一键生成（结果写入 session_state）
+# 6. 主按钮：一键生成（只负责更新 session_state）
 # =========================================================
 
 generate_btn = st.button("🚀 一键生成", use_container_width=True)
@@ -464,10 +433,16 @@ if generate_btn:
         raw_output = call_openai(prompt)
         optimized_resume, cover_letter_text = parse_model_output(raw_output)
 
-    # 把结果写入 session_state，供后续下载使用
+    # 把结果写入 session_state，供后续下载/展示使用
     st.session_state["optimized_resume"] = optimized_resume
-    st.session_state["cover_letter"] = cover_letter_text if need_cover_letter else ""
+    st.session_state["cover_letter_text"] = cover_letter_text
     st.session_state["result_lang"] = lang
+    st.session_state["last_meta"] = {
+        "filename": uploaded_file.name,
+        "filesize": uploaded_file.size,
+        "has_jd": bool(jd_text.strip()),
+        "need_cover_letter": need_cover_letter,
+    }
 
     # 记录生成事件
     safe_log_event(
@@ -483,40 +458,43 @@ if generate_btn:
     )
 
 # =========================================================
-# 6. 下载区（基于 session_state，点击下载不会丢失结果）
+# 7. 结果展示 & 下载区（只依赖 session_state，不会丢失）
 # =========================================================
 
-if st.session_state.get("optimized_resume"):
+optimized_resume = st.session_state.get("optimized_resume", "")
+cover_letter_text = st.session_state.get("cover_letter_text", "")
+
+if optimized_resume:
     st.success("生成完成，你可以下载优化后的简历（以及可选的求职信）。")
 
-    resume_docx_bytes = create_docx(st.session_state["optimized_resume"])
+    # 简历下载
+    resume_docx_bytes = create_docx_from_markdown(optimized_resume)
     resume_filename = "Optimized_Resume.docx"
     st.download_button(
         "⬇️ 下载优化简历（DOCX）",
         data=resume_docx_bytes,
         file_name=resume_filename,
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "wordprocessingml.document"
-        ),
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True,
     )
 
-    cover_text = st.session_state.get("cover_letter") or ""
-    if cover_text.strip():
-        cover_docx_bytes = create_docx(cover_text)
+    # 求职信下载
+    meta = st.session_state.get("last_meta", {})
+    if meta.get("need_cover_letter") and cover_letter_text.strip():
+        cover_docx_bytes = create_docx_from_markdown(cover_letter_text)
         cover_filename = "Cover_Letter.docx"
         st.download_button(
             "⬇️ 下载求职信（DOCX）",
             data=cover_docx_bytes,
             file_name=cover_filename,
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "wordprocessingml.document"
-            ),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
         )
+    elif meta.get("need_cover_letter"):
+        st.warning("本次模型输出中未识别到有效求职信内容，请检查提示词或重新生成。")
 
 # =========================================================
-# 7. 用户反馈入口（写入 analytics）
+# 8. 用户反馈入口
 # =========================================================
 
 st.markdown("---")
