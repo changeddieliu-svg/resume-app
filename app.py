@@ -18,18 +18,19 @@ st.set_page_config(
     layout="wide",
 )
 
-# 隐藏顶部菜单 & 页脚 & 右下角 “Manage app”
+# 隐藏顶部/底部菜单 + 右下角 Manage app
 HIDE_STREAMLIT_STYLE = """
     <style>
-    /* 顶部工具栏 / 装饰条 / 默认菜单 / 页眉页脚 */
     [data-testid="stToolbar"] { visibility: hidden; height: 0; position: fixed; }
     [data-testid="stDecoration"] { visibility: hidden; height: 0; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
 
-    /* 右下角状态栏 / Manage app 区域 */
-    [data-testid="stStatusWidget"] { visibility: hidden; height: 0; }
+    /* 精确隐藏右下角的 “Manage app” 按钮 */
+    a[aria-label="Manage app"] {
+        display: none !important;
+    }
     </style>
 """
 st.markdown(HIDE_STREAMLIT_STYLE, unsafe_allow_html=True)
@@ -267,6 +268,10 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("仅供个人求职使用，禁止商用与爬取。")
+
+    # Analytics 状态展示
+    analytics_status_text = "已启用 ✅" if ANALYTICS_AVAILABLE else "已关闭 ⚠️"
+    st.markdown(f"**Analytics 状态：** {analytics_status_text}")
 
 # ---- 页面标题 ----
 st.markdown("## 🧠 AI 智能简历优化")
