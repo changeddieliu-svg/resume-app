@@ -9,7 +9,7 @@ import pdfplumber
 from docx import Document
 
 # =========================================================
-# 1. 基础配置 & 安全地加载 analytics（可选）
+# 0. 页面基础配置 + 隐藏顶部菜单等
 # =========================================================
 
 st.set_page_config(
@@ -18,36 +18,37 @@ st.set_page_config(
     layout="wide",
 )
 
-# 隐藏顶部/底部菜单 + 右下角 Manage app
 HIDE_STREAMLIT_STYLE = """
     <style>
+    /* 顶部工具栏 / 菜单 / 页脚 */
     [data-testid="stToolbar"] { visibility: hidden; height: 0; position: fixed; }
     [data-testid="stDecoration"] { visibility: hidden; height: 0; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
-
-    /* 精确隐藏右下角的 “Manage app” 按钮 */
-    a[aria-label="Manage app"] {
-        display: none !important;
-    }
     </style>
 """
 st.markdown(HIDE_STREAMLIT_STYLE, unsafe_allow_html=True)
 
-# ---- OpenAI 客户端 ----
+# =========================================================
+# 1. OpenAI 客户端
+# =========================================================
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
 if not OPENAI_API_KEY:
     st.error("未配置 OPENAI_API_KEY，请在 Streamlit → Settings → Secrets 中添加。")
+
 client = OpenAI()
 
-# ---- 安全加载 analytics（Google Sheet） ----
-try:
-    import analytics  # 你自己的 analytics.py
+# =========================================================
+# 2. 加载 analytics（Google Sheet 埋点）
+# =========================================================
 
-    ANALYTICS_AVAILABLE = True
+try:
+    import analytics  # 你的 analytics.py
+    ANALYTICS_AVAILABLE = getattr(analytics, "ANALYTICS_ENABLED", False)
 except Exception:
     analytics = None
     ANALYTICS_AVAILABLE = False
@@ -60,12 +61,12 @@ def safe_log_event(event_type: str, data: dict):
     try:
         analytics.log_event(event_type, data)
     except Exception:
-        # 不在 UI 中打扰用户，只是静默失败
-        pass
+        # 不打扰用户，只在后台打印
+        print(f"[analytics] log_event 失败: {event_type}, {data}")
 
 
 # =========================================================
-# 2. 工具函数：读取简历 & 生成 DOCX
+# 3. 工具函数：读取简历 & 生成 DOCX（带简单排版）
 # =========================================================
 
 def read_docx(file_bytes: bytes) -> str:
@@ -113,10 +114,60 @@ def extract_resume_text(uploaded_file, enable_ocr: bool) -> str:
 
 
 def create_docx(content: str) -> bytes:
-    """将纯文本写入 DOCX，并以 bytes 形式返回用于下载"""
+    """
+    将模型输出的纯文本转换为带简单排版的 docx：
+    - 行首 ### / ## / # 视为标题（加粗）
+    - 整行 **xxx** 视为粗体标题（去掉 **）
+    - 行首 • / - / * 视为子弹列表
+    - 其余为普通段落
+    """
     doc = Document()
-    for line in content.splitlines():
-        doc.add_paragraph(line)
+
+    lines = content.splitlines()
+
+    for raw_line in lines:
+        line = raw_line.rstrip("\n")
+
+        # 空行 -> 空段落（增加留白）
+        if not line.strip():
+            doc.add_paragraph("")
+            continue
+
+        text = line.strip()
+        is_heading = False
+        is_full_bold = False
+
+        # 1) Markdown 风格标题：### / ## / #
+        for prefix in ("### ", "## ", "# "):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                is_heading = True
+                break
+
+        # 2) 整行 **xxx** 粗体
+        if text.startswith("**") and text.endswith("**") and len(text) > 4:
+            text = text[2:-2].strip()
+            is_full_bold = True
+
+        # 3) 子弹列表：• / - / *
+        is_bullet = False
+        for bullet_prefix in ("• ", "- ", "* "):
+            if text.startswith(bullet_prefix):
+                text = text[len(bullet_prefix):].strip()
+                is_bullet = True
+                break
+
+        # 4) 写入到 docx
+        if is_bullet:
+            p = doc.add_paragraph(style="List Bullet")
+        else:
+            p = doc.add_paragraph()
+
+        run = p.add_run(text)
+
+        if is_heading or is_full_bold:
+            run.bold = True
+
     buffer = io.BytesIO()
     doc.save(buffer)
     buffer.seek(0)
@@ -124,7 +175,7 @@ def create_docx(content: str) -> bytes:
 
 
 # =========================================================
-# 3. Prompt 构建 & 调 OpenAI
+# 4. Prompt 构建 & 调 OpenAI
 # =========================================================
 
 def detect_language(text: str) -> str:
@@ -199,11 +250,9 @@ def call_openai(prompt: str) -> str:
         model=MODEL_NAME,
         input=prompt,
     )
-    # 新版 Responses API：取第一段文本
     try:
         return response.output[0].content[0].text
     except Exception:
-        # 兜底：直接转成字符串
         return str(response)
 
 
@@ -234,13 +283,22 @@ def parse_model_output(raw: str):
 
 
 # =========================================================
-# 4. 页面 UI
+# 5. 初始化 session_state（保证下载后结果不丢）
 # =========================================================
 
-# ---- 左侧设置栏 ----
+if "optimized_resume" not in st.session_state:
+    st.session_state["optimized_resume"] = ""
+    st.session_state["cover_letter"] = ""
+    st.session_state["last_lang"] = "en"
+    st.session_state["last_meta"] = {}
+
+
+# =========================================================
+# 6. 页面 UI
+# =========================================================
+
 with st.sidebar:
     st.title("设置")
-
     st.caption("（左侧选项仅影响生成的强调方向）")
 
     focus_options = [
@@ -270,10 +328,11 @@ with st.sidebar:
     st.caption("仅供个人求职使用，禁止商用与爬取。")
 
     # Analytics 状态展示
-    analytics_status_text = "已启用 ✅" if ANALYTICS_AVAILABLE else "已关闭 ⚠️"
-    st.markdown(f"**Analytics 状态：** {analytics_status_text}")
+    if ANALYTICS_AVAILABLE:
+        st.caption("Analytics 状态：✅ 已启用")
+    else:
+        st.caption("Analytics 状态：⚠️ 已关闭")
 
-# ---- 页面标题 ----
 st.markdown("## 🧠 AI 智能简历优化")
 
 col_left, col_right = st.columns(2, gap="large")
@@ -300,7 +359,7 @@ with col_right:
 
 st.info("💡 提示：可在左侧设置“精修侧重/增强点”；若 PDF 为扫描件，可开启 OCR。")
 
-# ---- 首次打开页面的埋点 ----
+# 首次打开页面埋点
 safe_log_event(
     "page_view",
     {
@@ -310,7 +369,7 @@ safe_log_event(
 )
 
 # =========================================================
-# 5. 主按钮：一键生成
+# 7. 一键生成
 # =========================================================
 
 generate_btn = st.button("🚀 一键生成", use_container_width=True)
@@ -345,29 +404,16 @@ if generate_btn:
         raw_output = call_openai(prompt)
         optimized_resume, cover_letter_text = parse_model_output(raw_output)
 
-    # ===== 下载区 =====
-    st.success("生成完成，你可以下载优化后的简历（以及可选的求职信）。")
-
-    resume_docx_bytes = create_docx(optimized_resume)
-    resume_filename = "Optimized_Resume.docx"
-    st.download_button(
-        "⬇️ 下载优化简历（DOCX）",
-        data=resume_docx_bytes,
-        file_name=resume_filename,
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
-
-    if need_cover_letter and cover_letter_text.strip():
-        cover_docx_bytes = create_docx(cover_letter_text)
-        cover_filename = "Cover_Letter.docx"
-        st.download_button(
-            "⬇️ 下载求职信（DOCX）",
-            data=cover_docx_bytes,
-            file_name=cover_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
-    elif need_cover_letter:
-        st.warning("本次模型输出中未识别到有效求职信内容，请检查提示词或重新生成。")
+    # 把结果存到 session_state，保证后续点击下载不会丢失
+    st.session_state["optimized_resume"] = optimized_resume
+    st.session_state["cover_letter"] = cover_letter_text
+    st.session_state["last_lang"] = lang
+    st.session_state["last_meta"] = {
+        "filename": uploaded_file.name,
+        "filesize": uploaded_file.size,
+        "has_jd": bool(jd_text.strip()),
+        "need_cover_letter": need_cover_letter,
+    }
 
     # 记录生成事件
     safe_log_event(
@@ -383,7 +429,43 @@ if generate_btn:
     )
 
 # =========================================================
-# 6. 用户反馈入口
+# 8. 下载区（根据 session_state 显示，不会因为点击按钮丢失）
+# =========================================================
+
+if st.session_state["optimized_resume"]:
+    st.success("生成完成，你可以下载优化后的简历（以及可选的求职信）。")
+
+    resume_docx_bytes = create_docx(st.session_state["optimized_resume"])
+    resume_filename = "Optimized_Resume.docx"
+    st.download_button(
+        "⬇️ 下载优化简历（DOCX）",
+        data=resume_docx_bytes,
+        file_name=resume_filename,
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+    )
+
+    if st.session_state["last_meta"].get("need_cover_letter") and st.session_state[
+        "cover_letter"
+    ].strip():
+        cover_docx_bytes = create_docx(st.session_state["cover_letter"])
+        cover_filename = "Cover_Letter.docx"
+        st.download_button(
+            "⬇️ 下载求职信（DOCX）",
+            data=cover_docx_bytes,
+            file_name=cover_filename,
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+        )
+    elif st.session_state["last_meta"].get("need_cover_letter"):
+        st.warning("本次模型输出中未识别到有效求职信内容，请检查提示词或重新生成。")
+
+# =========================================================
+# 9. 用户反馈入口
 # =========================================================
 
 st.markdown("---")
