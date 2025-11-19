@@ -22,11 +22,26 @@ st.set_page_config(
 # 隐藏右上角的 “View code / Rerun” 菜单，避免普通用户看到源码
 HIDE_STREAMLIT_STYLE = """
     <style>
+    /* 原有隐藏按钮 */
     [data-testid="stToolbar"] { visibility: hidden; height: 0; position: fixed; }
     [data-testid="stDecoration"] { visibility: hidden; height: 0; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
+
+    /* 🔒 新增：隐藏右下角“Manage app” */
+    /* Streamlit Cloud 的 Manage app 是 iframe 挂载在底部角落 */
+    iframe[title="streamlitApp"] + div,
+    iframe + div [aria-label="Manage app"],
+    div[data-testid="ManageAppButton"],
+    button[aria-label="Manage app"] {
+        display: none !important;
+    }
+
+    /* 隐藏右下角角标的任何残留 */
+    .css-15zrgzn, .css-eczf16 { 
+        display: none !important;
+    }
     </style>
 """
 st.markdown(HIDE_STREAMLIT_STYLE, unsafe_allow_html=True)
