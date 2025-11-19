@@ -1,7 +1,6 @@
 import io
 import os
 from datetime import datetime
-import re
 
 import streamlit as st
 from openai import OpenAI
@@ -19,29 +18,18 @@ st.set_page_config(
     layout="wide",
 )
 
-# 隐藏右上角的 “View code / Rerun” 菜单，避免普通用户看到源码
+# 隐藏顶部菜单 & 页脚 & 右下角 “Manage app”
 HIDE_STREAMLIT_STYLE = """
     <style>
-    /* 原有隐藏按钮 */
+    /* 顶部工具栏 / 装饰条 / 默认菜单 / 页眉页脚 */
     [data-testid="stToolbar"] { visibility: hidden; height: 0; position: fixed; }
     [data-testid="stDecoration"] { visibility: hidden; height: 0; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
 
-    /* 🔒 新增：隐藏右下角“Manage app” */
-    /* Streamlit Cloud 的 Manage app 是 iframe 挂载在底部角落 */
-    iframe[title="streamlitApp"] + div,
-    iframe + div [aria-label="Manage app"],
-    div[data-testid="ManageAppButton"],
-    button[aria-label="Manage app"] {
-        display: none !important;
-    }
-
-    /* 隐藏右下角角标的任何残留 */
-    .css-15zrgzn, .css-eczf16 { 
-        display: none !important;
-    }
+    /* 右下角状态栏 / Manage app 区域 */
+    [data-testid="stStatusWidget"] { visibility: hidden; height: 0; }
     </style>
 """
 st.markdown(HIDE_STREAMLIT_STYLE, unsafe_allow_html=True)
@@ -76,7 +64,7 @@ def safe_log_event(event_type: str, data: dict):
 
 
 # =========================================================
-# 2. 工具函数：读取简历 & 生成 DOCX（带样式）
+# 2. 工具函数：读取简历 & 生成 DOCX
 # =========================================================
 
 def read_docx(file_bytes: bytes) -> str:
@@ -123,82 +111,11 @@ def extract_resume_text(uploaded_file, enable_ocr: bool) -> str:
         return ""
 
 
-# ---- Markdown → DOCX 的核心工具 ----
-
-BOLD_PATTERN = re.compile(r"\*\*(.+?)\*\*")
-
-
-def add_markdown_paragraph(doc: Document, text: str, style: str | None = None):
-    """
-    在 doc 中新增一段，并解析 **粗体**。
-    style 可为 None / "Heading 1" / "Heading 2" / "Heading 3" / "List Bullet"
-    """
-    if style:
-        para = doc.add_paragraph(style=style)
-    else:
-        para = doc.add_paragraph()
-
-    pos = 0
-    for m in BOLD_PATTERN.finditer(text):
-        # 普通文本片段
-        if m.start() > pos:
-            para.add_run(text[pos:m.start()])
-        # 粗体片段（去掉 **）
-        bold_text = m.group(1)
-        run = para.add_run(bold_text)
-        run.bold = True
-        pos = m.end()
-
-    # 最后剩余部分
-    if pos < len(text):
-        para.add_run(text[pos:])
-
-    return para
-
-
-def create_docx_from_markdown(content: str) -> bytes:
-    """
-    把模型输出的「类 Markdown 文本」转成 Word 文档：
-    - # / ## / ### → Heading 1/2/3
-    - - / * / • 开头 → List Bullet
-    - **粗体** → 粗体 Run
-    """
+def create_docx(content: str) -> bytes:
+    """将纯文本写入 DOCX，并以 bytes 形式返回用于下载"""
     doc = Document()
-    lines = content.splitlines()
-
-    for line in lines:
-        raw = line.rstrip("\n")
-        stripped = raw.strip()
-
-        # 空行：直接加空段落
-        if not stripped:
-            doc.add_paragraph("")
-            continue
-
-        # 标题（heading）
-        if stripped.startswith("### "):
-            text = stripped[4:].strip()
-            add_markdown_paragraph(doc, text, style="Heading 3")
-            continue
-        elif stripped.startswith("## "):
-            text = stripped[3:].strip()
-            add_markdown_paragraph(doc, text, style="Heading 2")
-            continue
-        elif stripped.startswith("# "):
-            text = stripped[2:].strip()
-            add_markdown_paragraph(doc, text, style="Heading 1")
-            continue
-
-        # 项目符号（支持 -, *, • 三种前缀）
-        bullet_prefixes = ("- ", "* ", "• ")
-        if any(stripped.startswith(p) for p in bullet_prefixes):
-            text = stripped[2:].strip()
-            add_markdown_paragraph(doc, text, style="List Bullet")
-            continue
-
-        # 其它普通段落
-        add_markdown_paragraph(doc, stripped)
-
+    for line in content.splitlines():
+        doc.add_paragraph(line)
     buffer = io.BytesIO()
     doc.save(buffer)
     buffer.seek(0)
@@ -316,21 +233,7 @@ def parse_model_output(raw: str):
 
 
 # =========================================================
-# 4. Session State：保存结果，避免下载时丢失
-# =========================================================
-
-if "optimized_resume" not in st.session_state:
-    st.session_state["optimized_resume"] = ""
-if "cover_letter_text" not in st.session_state:
-    st.session_state["cover_letter_text"] = ""
-if "result_lang" not in st.session_state:
-    st.session_state["result_lang"] = None
-if "last_meta" not in st.session_state:
-    st.session_state["last_meta"] = {}
-
-
-# =========================================================
-# 5. 页面 UI
+# 4. 页面 UI
 # =========================================================
 
 # ---- 左侧设置栏 ----
@@ -363,17 +266,6 @@ with st.sidebar:
     enable_ocr = st.checkbox("🔍 启用 OCR（扫描 PDF）", value=False)
 
     st.markdown("---")
-
-    # Analytics 状态显示
-    analytics_enabled = (
-        ANALYTICS_AVAILABLE
-        and getattr(analytics, "ANALYTICS_ENABLED", False)
-    )
-    if analytics_enabled:
-        st.caption("Analytics 状态：✅ 已开启（写入 Google Sheet）")
-    else:
-        st.caption("Analytics 状态：⚠️ 已关闭或配置不完整")
-
     st.caption("仅供个人求职使用，禁止商用与爬取。")
 
 # ---- 页面标题 ----
@@ -413,7 +305,7 @@ safe_log_event(
 )
 
 # =========================================================
-# 6. 主按钮：一键生成（只负责更新 session_state）
+# 5. 主按钮：一键生成
 # =========================================================
 
 generate_btn = st.button("🚀 一键生成", use_container_width=True)
@@ -448,16 +340,29 @@ if generate_btn:
         raw_output = call_openai(prompt)
         optimized_resume, cover_letter_text = parse_model_output(raw_output)
 
-    # 把结果写入 session_state，供后续下载/展示使用
-    st.session_state["optimized_resume"] = optimized_resume
-    st.session_state["cover_letter_text"] = cover_letter_text
-    st.session_state["result_lang"] = lang
-    st.session_state["last_meta"] = {
-        "filename": uploaded_file.name,
-        "filesize": uploaded_file.size,
-        "has_jd": bool(jd_text.strip()),
-        "need_cover_letter": need_cover_letter,
-    }
+    # ===== 下载区 =====
+    st.success("生成完成，你可以下载优化后的简历（以及可选的求职信）。")
+
+    resume_docx_bytes = create_docx(optimized_resume)
+    resume_filename = "Optimized_Resume.docx"
+    st.download_button(
+        "⬇️ 下载优化简历（DOCX）",
+        data=resume_docx_bytes,
+        file_name=resume_filename,
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    if need_cover_letter and cover_letter_text.strip():
+        cover_docx_bytes = create_docx(cover_letter_text)
+        cover_filename = "Cover_Letter.docx"
+        st.download_button(
+            "⬇️ 下载求职信（DOCX）",
+            data=cover_docx_bytes,
+            file_name=cover_filename,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    elif need_cover_letter:
+        st.warning("本次模型输出中未识别到有效求职信内容，请检查提示词或重新生成。")
 
     # 记录生成事件
     safe_log_event(
@@ -473,43 +378,7 @@ if generate_btn:
     )
 
 # =========================================================
-# 7. 结果展示 & 下载区（只依赖 session_state，不会丢失）
-# =========================================================
-
-optimized_resume = st.session_state.get("optimized_resume", "")
-cover_letter_text = st.session_state.get("cover_letter_text", "")
-
-if optimized_resume:
-    st.success("生成完成，你可以下载优化后的简历（以及可选的求职信）。")
-
-    # 简历下载
-    resume_docx_bytes = create_docx_from_markdown(optimized_resume)
-    resume_filename = "Optimized_Resume.docx"
-    st.download_button(
-        "⬇️ 下载优化简历（DOCX）",
-        data=resume_docx_bytes,
-        file_name=resume_filename,
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        use_container_width=True,
-    )
-
-    # 求职信下载
-    meta = st.session_state.get("last_meta", {})
-    if meta.get("need_cover_letter") and cover_letter_text.strip():
-        cover_docx_bytes = create_docx_from_markdown(cover_letter_text)
-        cover_filename = "Cover_Letter.docx"
-        st.download_button(
-            "⬇️ 下载求职信（DOCX）",
-            data=cover_docx_bytes,
-            file_name=cover_filename,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-        )
-    elif meta.get("need_cover_letter"):
-        st.warning("本次模型输出中未识别到有效求职信内容，请检查提示词或重新生成。")
-
-# =========================================================
-# 8. 用户反馈入口
+# 6. 用户反馈入口
 # =========================================================
 
 st.markdown("---")
